@@ -218,11 +218,18 @@ async function handleUnifiedNodesApi(request, env, ctx) {
           }
         }
         nodes.push(...sstpNodes);
-        sources.sstp = { enabled: true, available: true, count: sstpNodes.length, generated_at: data.generated_at || null };
+        sources.sstp = {
+          enabled: true,
+          available: sstpNodes.length > 0,
+          count: sstpNodes.length,
+          generated_at: data.generated_at || null,
+          ...(sstpNodes.length ? {} : { reason: 'SSTP 检测结果中暂无可用节点' }),
+        };
       } else {
         sources.sstp = { enabled: true, available: false, count: 0, reason: 'SSTP 数据尚未生成或格式无效' };
       }
     } catch (e) {
+      console.warn('[api/nodes] SSTP 可选来源读取失败：', e && e.message ? e.message : e);
       sources.sstp = { enabled: true, available: false, count: 0, reason: 'SSTP 数据暂时不可用' };
     }
   } else if (includeSstp) {
