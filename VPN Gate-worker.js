@@ -589,8 +589,17 @@ function prioritize(nodes) {
 // ---------------------------------------------------------------------------
 // 分类（以 Worker 的出口信息为准，缺失时才看 Operator 关键字）
 // ---------------------------------------------------------------------------
-function classifyNetwork(org, isDatacenter) {
+function classifyNetwork(org, isDatacenter, exitInfo = {}) {
   if (isDatacenter === true) return "datacenter";
+  // 已知代理/VPN/Tor/滥用/黑洞出口不能因 ASN 名称像运营商而进入住宅发布池。
+  if (
+    exitInfo.is_proxy === true ||
+    exitInfo.is_vpn === true ||
+    exitInfo.is_tor === true ||
+    exitInfo.is_abuser === true ||
+    exitInfo.is_bogon === true ||
+    exitInfo.is_crawler === true
+  ) return "unknown";
   const upper = (org || "").toUpperCase();
   if (upper) {
     if (DATA_CENTER_ORG_KEYWORDS.some((k) => upper.includes(k))) return "datacenter";
@@ -666,8 +675,16 @@ async function checkOne(node, cfg, budget, service) {
         asn: get(asn.asn),
         org,
         is_datacenter: get(exitInfo.is_datacenter),
+        is_proxy: get(exitInfo.is_proxy ?? exitInfo.privacy?.is_proxy),
+        is_vpn: get(exitInfo.is_vpn ?? exitInfo.privacy?.is_vpn),
+        is_tor: get(exitInfo.is_tor ?? exitInfo.privacy?.is_tor),
+        is_abuser: get(exitInfo.is_abuser ?? exitInfo.privacy?.is_abuser),
+        is_bogon: get(exitInfo.is_bogon ?? exitInfo.privacy?.is_bogon),
+        is_crawler: get(exitInfo.is_crawler),
+        is_mobile: get(exitInfo.is_mobile ?? exitInfo.privacy?.is_mobile),
+        is_satellite: get(exitInfo.is_satellite ?? exitInfo.privacy?.is_satellite),
       };
-      result.residential = classifyNetwork(org, exitInfo.is_datacenter);
+      result.residential = classifyNetwork(org, exitInfo.is_datacenter, result.exit);
     } else if (success) {
       result.residential = "unknown";
     }
