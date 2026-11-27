@@ -1990,6 +1990,7 @@ async function handleUnifiedNodesApi(request, env, ctx) {
     source: 'vpngate-openvpn',
     protocol: 'openvpn',
     host: s.hostName || s.ip,
+    configDataBase64: s.configDataBase64 || '',
     ip: s.ip || null,
     port: null,
     country_code: (s.countryShort || '').toUpperCase(),
