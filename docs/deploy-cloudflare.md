@@ -25,6 +25,14 @@ npx wrangler@4 deploy --config wrangler.sstp.toml
 
 配置中的 Cron 每 10 分钟触发一次；存在未完成任务时继续执行，没有未完成任务时按 INTERVAL_MINUTES=60 每小时启动新检测。请将 CHECK_WORKER 改为实际可用的探测 Worker 地址。
 
+生产环境必须设置 TOKEN，避免任何人都能调用 /api/step 消耗 Worker 子请求额度。部署后执行：
+
+~~~bash
+npx wrangler@4 secret put TOKEN --config wrangler.sstp.toml
+~~~
+
+输入一段随机生成的长令牌；打开 /run 手动执行时，在页面输入同一个令牌。不要把令牌写进 wrangler 配置、仓库或公开变量。
+
 ## 3. 部署主节点 Worker（可选）
 
 ~~~bash
