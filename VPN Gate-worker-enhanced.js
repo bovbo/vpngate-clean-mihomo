@@ -1135,7 +1135,7 @@ async function runStepInner({ env, store, cfg, log, lines, meta, trigger, emit }
 
   if (pending.length) {
     const batch = cfg.batchSize > 0 ? pending.slice(0, cfg.batchSize) : pending;
-    const qualityReserve = batch.length === pending.length ? Math.min(QUALITY_MAX_BATCHES, Math.ceil(state.nodes.length / QUALITY_BATCH_SIZE)) : 0;
+    const qualityReserve = batch.length === pending.length ? Math.min(QUALITY_MAX_BATCHES, Math.ceil(state.nodes.length / QUALITY_BATCH_SIZE), Math.max(0, cfg.subrequestLimit - cfg.optimalUrls.length - 1)) : 0;
     budget.reserve = batch.length === pending.length ? cfg.optimalUrls.length + qualityReserve : 0;
     log("CLOUDFLARE WORKER", `本轮检测 ${batch.length}/${pending.length} 个节点`);
     const stopAt = Math.min(Date.now() + cfg.stepSeconds * 1000, state.checkStartedAt + cfg.deadlineS * 1000);
