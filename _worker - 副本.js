@@ -235,6 +235,16 @@ async function checkProxy({ type, value }, colo) {
 			if (!Number.isInteger(proxy.port) || proxy.port < 1 || proxy.port > 65535) {
 				throw new Error('SSTP proxy port must be between 1 and 65535');
 			}
+			// Metadata only: never copy credentials or the full hostname into diagnostics.
+			proxy._sstpDiagnostics = {
+				stage: 'parsed',
+				hostnameLength: proxy.hostname.length,
+				hostnameKind: isIPv4(stripIPv6Brackets(proxy.hostname)) ? 'ipv4' : (stripIPv6Brackets(proxy.hostname).includes(':') ? 'ipv6' : 'dns-name'),
+				hostnameAscii: /^[\\x00-\\x7F]+$/.test(stripIPv6Brackets(proxy.hostname)),
+				hostnameHasWhitespace: /\\s/.test(stripIPv6Brackets(proxy.hostname)),
+				hostnameHasSlash: /[\\/\\\\]/.test(stripIPv6Brackets(proxy.hostname)),
+				port: proxy.port
+			};
 		} 
 	} catch (error) {
 		return buildCheckResult({
@@ -382,6 +392,7 @@ async function checkProxy({ type, value }, colo) {
 			success: false,
 			colo: colo,
 			error: error?.message || String(error),
+			diagnostics: proxy?.type === 'sstp' ? (proxy._sstpDiagnostics || { stage: 'sstp_failed_before_diagnostics' }) : null,
 			responseTime: Date.now() - startedAt
 		});
 	} finally {
@@ -389,7 +400,7 @@ async function checkProxy({ type, value }, colo) {
 	}
 }
 
-function buildCheckResult({ type, rawValue, proxy, success, colo = null, exit = null, error = null, responseTime }) {
+function buildCheckResult({ type, rawValue, proxy, success, colo = null, exit = null, error = null, responseTime, diagnostics = null }) {
 	const candidate = proxy ? formatProxyAuthority(proxy) : stripProxyScheme(rawValue);
 	const result = {
 		candidate,
@@ -404,7 +415,10 @@ function buildCheckResult({ type, rawValue, proxy, success, colo = null, exit = 
 		responseTime
 	};
 	if (success) result.exit = exit;
-	else result.error = error || 'Proxy check failed';
+	else {
+		result.error = error || 'Proxy check failed';
+		if (diagnostics) result.diagnostics = diagnostics;
+	}
 	return result;
 }
 
@@ -1186,10 +1200,16 @@ function createSstpClient(proxy) {
 				{ hostname: serverHost, port: serverPort },
 				{ secureTransport: 'on', allowHalfOpen: false }
 			);
+			if (proxy?._sstpDiagnostics) proxy._sstpDiagnostics.stage = 'socket_connecting';
 			await withTimeout(socket.opened, CONNECT_TIMEOUT_MS, 'SSTP server connection timed out');
+			if (proxy?._sstpDiagnostics) proxy._sstpDiagnostics.stage = 'socket_connected';
 		} catch (error) {
 			try { socket?.close?.(); } catch (closeError) { }
 			const detail = error?.message || String(error);
+			if (proxy?._sstpDiagnostics) {
+				proxy._sstpDiagnostics.stage = 'socket_connect_failed';
+				proxy._sstpDiagnostics.socketError = detail.slice(0, 240);
+			}
 			throw new Error(`SSTP TCP connection to ${serverHost}:${serverPort} failed: ${detail}`);
 		}
 
