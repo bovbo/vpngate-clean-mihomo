@@ -4,6 +4,11 @@ name = "vpngate-sstp-publisher"
 main = "VPN Gate-worker.js"
 compatibility_date = "2026-07-08"
 
+# 如需绑定自定义域名，确认域名未绑定到其他 Worker 后再启用。
+# [[routes]]
+# pattern = "gat.liee.ipv64.net"
+# custom_domain = true
+
 # 每 10 分钟触发一次：有未完成任务则续跑；没有任务时每 60 分钟开始新一轮。
 [triggers]
 crons = ["*/10 * * * *"]
