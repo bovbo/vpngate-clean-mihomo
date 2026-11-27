@@ -869,7 +869,7 @@ function buildCleanNodesText(data, edgeHosts, cfg, maxRisk = 50) {
       datacenter: nodes.filter((n) => n.residential === "datacenter").length,
       unknown: nodes.filter((n) => n.residential !== "residential" && n.residential !== "datacenter").length };
   }
-  return buildNodesText(filtered, edgeHosts, cfg, { annotateQuality: true, includeAll: true });
+  return buildNodesText(filtered, edgeHosts, cfg);
 }
 
 // /sub 输出完整可导入配置；clean=1 时仅保留已验证的低风险住宅/运营商出口。
@@ -880,7 +880,7 @@ function buildSubscriptionText(data, edgeHosts, cfg, cleanOnly = false) {
       const nodes = (group.nodes || []).filter((node) => isCleanGateNode(node, 50));
       if (nodes.length) filtered.countries[code] = { ...group, nodes, count: nodes.length };
     }
-    return buildNodesText(filtered, edgeHosts, cfg, { annotateQuality: true, includeAll: true });
+    return buildNodesText(filtered, edgeHosts, cfg, { annotateQuality: true, includeAll: true, sortQuality: true });
   }
   return buildNodesText(data, edgeHosts, cfg, { annotateQuality: true, includeAll: true });
 }
@@ -953,7 +953,9 @@ function buildNodesText(data, edgeHosts, cfg, options = {}) {
   );
   for (const [code, group] of ordered) {
     const name = COUNTRY_ZH[code] || group.name || code;
-    const nodes = [...group.nodes].sort((a, b) => compareTuples(nodeSortKey(a), nodeSortKey(b)));
+    const nodes = [...group.nodes].sort((a, b) => options.sortQuality
+      ? compareTuples([-(Number(a.quality && a.quality.clean) || -1), a.latency_ms == null ? 1 : 0, Number(a.latency_ms) || 0], [-(Number(b.quality && b.quality.clean) || -1), b.latency_ms == null ? 1 : 0, Number(b.latency_ms) || 0])
+      : compareTuples(nodeSortKey(a), nodeSortKey(b)));
     const residential = nodes.filter((n) => n.residential === "residential");
     const others = nodes.filter((n) => n.residential !== "residential");
     const chosen = options.includeAll ? nodes : [
