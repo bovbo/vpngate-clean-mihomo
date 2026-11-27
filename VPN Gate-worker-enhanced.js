@@ -978,7 +978,7 @@ function buildNodesText(data, edgeHosts, cfg, options = {}) {
       const q = node.quality && Number.isFinite(Number(node.quality.clean)) ? Math.max(0, Math.min(100, Math.round(Number(node.quality.clean)))) : null;
       const purity = q === null ? "P?" : `P${pad(q, 3)}`;
       const remark = `${name}-${kind}-${pad(counters[kindKey])}${options.annotateQuality ? `-${purity}` : ""}`;
-      lines.push(`${entry}#${sanitizeRemark(remark)}${link}`);
+      lines.push(`${entry}#${sanitizeRemark(remark)}$${link}`);
     }
   }
   return lines.join("\n") + (lines.length ? "\n" : "");
