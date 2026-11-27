@@ -869,7 +869,20 @@ function buildCleanNodesText(data, edgeHosts, cfg, maxRisk = 50) {
       datacenter: nodes.filter((n) => n.residential === "datacenter").length,
       unknown: nodes.filter((n) => n.residential !== "residential" && n.residential !== "datacenter").length };
   }
-  return buildNodesText(filtered, edgeHosts, cfg);
+  return buildNodesText(filtered, edgeHosts, cfg, { annotateQuality: true, includeAll: true });
+}
+
+// /sub 输出完整可导入配置；clean=1 时仅保留已验证的低风险住宅/运营商出口。
+function buildSubscriptionText(data, edgeHosts, cfg, cleanOnly = false) {
+  if (cleanOnly) {
+    const filtered = { ...data, countries: {} };
+    for (const [code, group] of Object.entries(data.countries || {})) {
+      const nodes = (group.nodes || []).filter((node) => isCleanGateNode(node, 50));
+      if (nodes.length) filtered.countries[code] = { ...group, nodes, count: nodes.length };
+    }
+    return buildNodesText(filtered, edgeHosts, cfg, { annotateQuality: true, includeAll: true });
+  }
+  return buildNodesText(data, edgeHosts, cfg, { annotateQuality: true, includeAll: true });
 }
 
 // ---------------------------------------------------------------------------
@@ -930,7 +943,7 @@ function buildOutputs({ results, rawCount, sstpCount, source, workerHost, durati
   };
 }
 
-function buildNodesText(data, edgeHosts, cfg) {
+function buildNodesText(data, edgeHosts, cfg, options = {}) {
   if (!edgeHosts.length) throw new ConfigError("优选入口池为空，无法生成 nodes.txt");
   const lines = [];
   const seenLinks = new Set();
@@ -943,7 +956,7 @@ function buildNodesText(data, edgeHosts, cfg) {
     const nodes = [...group.nodes].sort((a, b) => compareTuples(nodeSortKey(a), nodeSortKey(b)));
     const residential = nodes.filter((n) => n.residential === "residential");
     const others = nodes.filter((n) => n.residential !== "residential");
-    const chosen = [
+    const chosen = options.includeAll ? nodes : [
       ...residential.slice(0, cfg.maxResidentialPerCountry),
       ...others.slice(0, cfg.maxDatacenterPerCountry),
     ];
@@ -957,7 +970,10 @@ function buildNodesText(data, edgeHosts, cfg) {
       const kind = { residential: "住宅", datacenter: "机房", unknown: "未知" }[kindKey];
       const entry = edgeHosts[index % edgeHosts.length];
       index += 1;
-      lines.push(`${entry}#${sanitizeRemark(`${name}-${kind}-${pad(counters[kindKey])}`)}$${link}`);
+      const q = node.quality && Number.isFinite(Number(node.quality.clean)) ? Math.max(0, Math.min(100, Math.round(Number(node.quality.clean)))) : null;
+      const purity = q === null ? "P?" : `P${pad(q, 3)}`;
+      const remark = `${name}-${kind}-${pad(counters[kindKey])}${options.annotateQuality ? `-${purity}` : ""}`;
+      lines.push(`${entry}#${sanitizeRemark(remark)}${link}`);
     }
   }
   return lines.join("\n") + (lines.length ? "\n" : "");
@@ -1858,6 +1874,21 @@ export default {
     try {
       if (path === "/" || path === "/index.html") {
         return textResponse(INDEX_HTML, "text/html; charset=utf-8", 200, NO_CACHE);
+      }
+      if (path === "/sub") {
+        const store = getKV(env);
+        const [rawData, rawHosts] = await Promise.all([store.get("data.json", "json"), store.get("edge-hosts.json", "json")]);
+        if (!rawData || !Array.isArray(rawHosts)) {
+          return textResponse("尚未生成订阅：请先打开 /run 执行一次检测\\n", "text/plain; charset=utf-8", 404, NO_CACHE);
+        }
+        const cfg = loadConfig(env);
+        const cleanOnly = url.searchParams.get("clean") === "1";
+        const body = buildSubscriptionText(rawData, rawHosts, cfg, cleanOnly);
+        return textResponse(body, "text/plain; charset=utf-8", 200, {
+          "access-control-allow-origin": "*",
+          "content-disposition": 'inline; filename="vpngate-sub.txt"',
+          ...NO_CACHE
+        });
       }
       if (path === "/nodes-clean.txt") {
         const store = getKV(env);
