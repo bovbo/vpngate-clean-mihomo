@@ -240,9 +240,9 @@ async function checkProxy({ type, value }, colo) {
 				stage: 'parsed',
 				hostnameLength: proxy.hostname.length,
 				hostnameKind: isIPv4(stripIPv6Brackets(proxy.hostname)) ? 'ipv4' : (stripIPv6Brackets(proxy.hostname).includes(':') ? 'ipv6' : 'dns-name'),
-				hostnameAscii: /^[\\x00-\\x7F]+$/.test(stripIPv6Brackets(proxy.hostname)),
-				hostnameHasWhitespace: /\\s/.test(stripIPv6Brackets(proxy.hostname)),
-				hostnameHasSlash: /[\\/\\\\]/.test(stripIPv6Brackets(proxy.hostname)),
+				hostnameAscii: /^[\x00-\x7F]+$/.test(stripIPv6Brackets(proxy.hostname)),
+				hostnameHasWhitespace: /\s/.test(stripIPv6Brackets(proxy.hostname)),
+				hostnameHasSlash: /[\/\\]/.test(stripIPv6Brackets(proxy.hostname)),
 				port: proxy.port
 			};
 		} 
