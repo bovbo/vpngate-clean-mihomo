@@ -238,11 +238,20 @@ async function handleUnifiedNodesApi(request, env, ctx) {
     // 已确认的住宅 ISP 在非代理、非机房前提下执行风险封顶 10。
     if (q) {
       let risk = Number(q.risk);
+      const exitProxy = exit.is_proxy === true || exit.is_vpn === true || exit.is_tor === true;
+      if (exitProxy && !q.proxy) {
+        risk += 45;
+        quality.proxy = true;
+      }
       if (networkKind === 'datacenter' && !q.hosting) {
         risk += 25;
         quality.hosting = true;
       }
-      if (networkKind === 'residential' && !q.proxy && !quality.hosting) {
+      if (exit.is_mobile === true && !q.mobile) {
+        risk = Math.max(0, risk - 20);
+        quality.mobile = true;
+      }
+      if (networkKind === 'residential' && !quality.proxy && !quality.hosting) {
         risk = Math.min(risk, 10);
       }
       risk = Math.max(0, Math.min(100, risk));
