@@ -69,7 +69,13 @@ export default {
         });
       }
       if (p === '/api/servers') return await handleServersApi(request, ctx);
-      if (p === '/api/nodes') return await handleUnifiedNodesApi(request, env, ctx);
+      if (p === '/api/nodes') {
+        if (request.method !== 'GET' && request.method !== 'HEAD') {
+          return new Response('仅支持 GET/HEAD 请求', { status: 405, headers: { Allow: 'GET, HEAD' } });
+        }
+        if (request.method === 'HEAD') return new Response(null, { status: 200, headers: { 'cache-control': 'public, max-age=30', 'access-control-allow-origin': '*' } });
+        return await handleUnifiedNodesApi(request, env, ctx);
+      }
       if (p === '/sub' || p === '/mihomo' || p === '/clash' || p === '/subscribe') {
         return await handleSubscription(url, ctx);
       }
@@ -131,7 +137,13 @@ async function handleUnifiedNodesApi(request, env, ctx) {
   const u = new URL(request.url);
   const includeSstp = u.searchParams.get('sstp') !== '0';
   const { servers, cached } = await getServers(ctx, u.searchParams.get('refresh') === '1');
-  try { await enrichQuality(servers, ctx); } catch (e) {}
+  try {
+    await enrichQuality(servers, ctx);
+  } catch (e) {
+    // 质量画像是增强信息；失败时保留基础节点，并记录诊断信息。
+    console.warn('[api/nodes] 质量画像增强失败，已降级继续返回节点：', e && e.message ? e.message : e);
+    for (const server of servers) server._q = server._q || null;
+  }
   const nodes = servers.map((s) => ({
     id: 'openvpn:' + String(s.ip || s.hostName || ''),
     source: 'vpngate-openvpn',
@@ -267,8 +279,7 @@ function assessQuality(r) {
   if (kind === 'business') risk += 6;
   if (HOSTING_KEYWORDS.test(orgText)) risk += 15; // ASN/ISP 命中托管或 VPN 关键词
   if (mobile) risk = Math.max(0, risk - 20);      // 蜂窝网络更接近住宅, 减分
-  // 可信住宅/ISP 网络：未被标代理或机房，且 ASN/ISP 名称未命中托管特征时记为纯净度 100
-  if ((kind === 'isp' || kind === 'residential') && !proxy && !hosting && !HOSTING_KEYWORDS.test(orgText)) risk = 0;
+  // 不因 type=isp/residential 单一标签直接判定 100 分；缺少风险信号不等于已验证住宅纯净。
   risk = Math.max(0, Math.min(100, risk));
   const clean = 100 - risk;
   let grade = 'clean';
