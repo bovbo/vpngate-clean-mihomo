@@ -1834,7 +1834,8 @@ export default {
     const url = new URL(request.url);
     const p = url.pathname.replace(/\/+$/, '') || '/';
     try {
-      if (p === '/nodes-clean.txt') return await handleCleanNodesText(env);
+      if (p === '/nodes-clean.txt' || p === '/住宅独立.txt') return await handleSSTPNodesText(env, 'residential');
+      if (p === '/全.txt') return await handleSSTPNodesText(env, 'all');
       if (p === '/nodes.txt') return await SSTP_SUBSYSTEM.fetch(request, env, ctx);
       if (p === '/data.json' || p === '/run' || p === '/api/step' || p === '/status') {
         return await SSTP_SUBSYSTEM.fetch(request, env, ctx);
@@ -1869,19 +1870,60 @@ export default {
 };
 
 
-async function handleCleanNodesText(env) {
-  const headers={'content-type':'text/plain; charset=utf-8','cache-control':'no-store','access-control-allow-origin':'*'};
-  if(!env.GATE_KV)return new Response('GATE_KV 未绑定\\n',{status:503,headers});
-  const raw=await env.GATE_KV.get('data.json');if(!raw)return new Response('# 暂无检测数据；请先运行 /run\\n',{status:200,headers});
-  let data;try{data=typeof raw==='string'?JSON.parse(raw):raw;}catch(e){return new Response('data.json 格式错误\\n',{status:502,headers});}
-  const denied=['is_proxy','is_vpn','is_tor'],rows=[];
-  for(const [code,group] of Object.entries(data.countries||{}))for(const n of (group&&Array.isArray(group.nodes)?group.nodes:[])){
-    const ex=n&&n.exit||{};if(!n||n.success!==true||n.residential!=='residential'||!n.host||!(Number(n.port)>0)||denied.some(k=>ex[k]===true))continue;
-    rows.push({code:String(n.country_code||code).toUpperCase(),country:n.country||group.name||code,host:n.host,port:Number(n.port),latency:Number(n.latency_ms)||Number(n.ping)||999999});
+async function handleSSTPNodesText(env, mode) {
+  const headers = {
+    'content-type': 'text/plain; charset=utf-8',
+    'cache-control': 'no-store',
+    'access-control-allow-origin': '*',
+  };
+  if (!env.GATE_KV) return new Response('GATE_KV 未绑定\\n', { status: 503, headers });
+  const raw = await env.GATE_KV.get('data.json');
+  if (!raw) return new Response('# 暂无检测数据；请先运行 /run\\n', { status: 200, headers });
+  let data;
+  try {
+    data = typeof raw === 'string' ? JSON.parse(raw) : raw;
+  } catch (e) {
+    return new Response('data.json 格式错误\\n', { status: 502, headers });
   }
-  rows.sort((a,b)=>a.code.localeCompare(b.code)||a.latency-b.latency||a.host.localeCompare(b.host));
-  const counts={},lines=rows.map(n=>{counts[n.code]=(counts[n.code]||0)+1;const label=String(n.country).replace(/[#$\\r\\n]/g,'').trim()||n.code;return 'sstp://vpn:vpn@'+n.host+':'+n.port+'#'+encodeURIComponent(label+'-住宅-'+String(counts[n.code]).padStart(2,'0'));});
-  return new Response(lines.length?lines.join('\\n')+'\\n':'# 当前没有检测成功且明确识别为住宅/运营商网络的 SSTP 节点\\n',{status:200,headers});
+
+  const rows = [];
+  const seen = new Set();
+  for (const [code, group] of Object.entries(data.countries || {})) {
+    for (const n of (group && Array.isArray(group.nodes) ? group.nodes : [])) {
+      if (!n || n.success !== true || !n.host || !(Number(n.port) > 0) || Number(n.port) > 65535) continue;
+      if (mode === 'residential') {
+        const ex = n.exit || {};
+        const denied = ['is_proxy', 'is_vpn', 'is_tor'];
+        if (n.residential !== 'residential' || denied.some((key) => ex[key] === true)) continue;
+      }
+      const host = String(n.host).trim();
+      const port = Number(n.port);
+      const key = host.toLowerCase() + ':' + port;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      rows.push({
+        code: String(n.country_code || code).toUpperCase(),
+        country: n.country || group.name || code,
+        host,
+        port,
+        kind: n.residential === 'residential' ? '住宅' : n.residential === 'datacenter' ? '机房' : '未分类',
+        latency: Number(n.latency_ms) || Number(n.ping) || 999999,
+      });
+    }
+  }
+
+  rows.sort((a, b) => a.code.localeCompare(b.code) || a.latency - b.latency || a.host.localeCompare(b.host));
+  const counts = {};
+  const lines = rows.map((n) => {
+    counts[n.code] = (counts[n.code] || 0) + 1;
+    const label = String(n.country).replace(/[#$\\r\\n]/g, '').trim() || n.code;
+    const suffix = mode === 'residential' ? '住宅' : n.kind;
+    return 'sstp://vpn:vpn@' + n.host + ':' + n.port + '#' + encodeURIComponent(label + '-' + suffix + '-' + String(counts[n.code]).padStart(2, '0'));
+  });
+  const empty = mode === 'residential'
+    ? '# 当前没有检测成功且明确识别为住宅/运营商网络的 SSTP 节点\\n'
+    : '# 当前没有检测成功的 SSTP 节点\\n';
+  return new Response(lines.length ? lines.join('\\n') + '\\n' : empty, { status: 200, headers });
 }
 
 // ------------------------------------------------------------
