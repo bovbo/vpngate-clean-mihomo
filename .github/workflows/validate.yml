@@ -37,5 +37,5 @@ jobs:
           cp wrangler.sstp.toml.example .wrangler-ci-sstp.toml
           sed -i '/^\[\[kv_namespaces\]\]/,$d' .wrangler-ci-sstp.toml
           npx --yes wrangler@4 deploy --dry-run --config .wrangler-ci-sstp.toml
-          (cd worker && npx --yes wrangler@4 deploy --dry-run --config wrangler.toml.example)
+          (cd worker && cp wrangler.toml.example .wrangler-ci.toml && npx --yes wrangler@4 deploy --dry-run --config .wrangler-ci.toml && rm -f .wrangler-ci.toml)
           rm -f .wrangler-ci-sstp.toml
