@@ -635,14 +635,11 @@ function prioritize(nodes) {
 // ---------------------------------------------------------------------------
 function classifyNetwork(org, isDatacenter, exitInfo = {}) {
   if (isDatacenter === true) return "datacenter";
-  // 已知代理/VPN/Tor/滥用/黑洞出口不能因 ASN 名称像运营商而进入住宅发布池。
+  // 代理/VPN/Tor 不进入住宅池；abuser/bogon/crawler 是风险信号，单独计分，不抹掉真实 ISP/住宅 ASN 分类。
   if (
     exitInfo.is_proxy === true ||
     exitInfo.is_vpn === true ||
-    exitInfo.is_tor === true ||
-    exitInfo.is_abuser === true ||
-    exitInfo.is_bogon === true ||
-    exitInfo.is_crawler === true
+    exitInfo.is_tor === true
   ) return "unknown";
   const upper = (org || "").toUpperCase();
   if (upper) {
@@ -1877,7 +1874,7 @@ async function handleCleanNodesText(env) {
   if(!env.GATE_KV)return new Response('GATE_KV 未绑定\\n',{status:503,headers});
   const raw=await env.GATE_KV.get('data.json');if(!raw)return new Response('# 暂无检测数据；请先运行 /run\\n',{status:200,headers});
   let data;try{data=typeof raw==='string'?JSON.parse(raw):raw;}catch(e){return new Response('data.json 格式错误\\n',{status:502,headers});}
-  const denied=['is_proxy','is_vpn','is_tor','is_abuser','is_bogon','is_crawler'],rows=[];
+  const denied=['is_proxy','is_vpn','is_tor'],rows=[];
   for(const [code,group] of Object.entries(data.countries||{}))for(const n of (group&&Array.isArray(group.nodes)?group.nodes:[])){
     const ex=n&&n.exit||{};if(!n||n.success!==true||n.residential!=='residential'||!n.host||!(Number(n.port)>0)||denied.some(k=>ex[k]===true))continue;
     rows.push({code:String(n.country_code||code).toUpperCase(),country:n.country||group.name||code,host:n.host,port:Number(n.port),latency:Number(n.latency_ms)||Number(n.ping)||999999});
@@ -2056,7 +2053,12 @@ async function handleUnifiedNodesApi(request, env, ctx) {
         risk = Math.max(0, risk - 20);
         quality.mobile = true;
       }
-      if (networkKind === 'residential' && !quality.proxy && !quality.hosting) {
+      // 风险情报不再把住宅 ISP 从节点池删除，但必须反映在纯净度评分中。
+      if (exit.is_abuser === true) risk += 20;
+      if (exit.is_bogon === true) risk += 35;
+      if (exit.is_crawler === true) risk += 10;
+      const hasAbuseSignal = exit.is_abuser === true || exit.is_bogon === true || exit.is_crawler === true;
+      if (networkKind === 'residential' && !quality.proxy && !quality.hosting && !hasAbuseSignal) {
         risk = Math.min(risk, 10);
       }
       risk = Math.max(0, Math.min(100, risk));
