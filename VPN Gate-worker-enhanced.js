@@ -953,9 +953,12 @@ function buildNodesText(data, edgeHosts, cfg, options = {}) {
   );
   for (const [code, group] of ordered) {
     const name = COUNTRY_ZH[code] || group.name || code;
-    const nodes = [...group.nodes].sort((a, b) => options.sortQuality
-      ? compareTuples([-(Number(a.quality && a.quality.clean) || -1), a.latency_ms == null ? 1 : 0, Number(a.latency_ms) || 0], [-(Number(b.quality && b.quality.clean) || -1), b.latency_ms == null ? 1 : 0, Number(b.latency_ms) || 0])
-      : compareTuples(nodeSortKey(a), nodeSortKey(b)));
+    const nodes = [...group.nodes].sort((a, b) => {
+      if (!options.sortQuality) return compareTuples(nodeSortKey(a), nodeSortKey(b));
+      const aq = a.quality && Number.isFinite(Number(a.quality.clean)) ? Number(a.quality.clean) : -1;
+      const bq = b.quality && Number.isFinite(Number(b.quality.clean)) ? Number(b.quality.clean) : -1;
+      return compareTuples([-bq, a.latency_ms == null ? 1 : 0, Number(a.latency_ms) || 0], [-aq, b.latency_ms == null ? 1 : 0, Number(b.latency_ms) || 0]);
+    });
     const residential = nodes.filter((n) => n.residential === "residential");
     const others = nodes.filter((n) => n.residential !== "residential");
     const chosen = options.includeAll ? nodes : [
