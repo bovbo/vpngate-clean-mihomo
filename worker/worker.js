@@ -281,12 +281,14 @@ function assessQuality(r) {
   const kind = String(r.type || '').toLowerCase();
   const orgText = [r.isp, r.org, r.as, r.asname, r.type].filter(Boolean).join(' ');
   let risk = 0;
-  if (proxy) risk += 45;                 // 已知匿名代理/VPN 出口 —— 风险主因
+  if (proxy) risk += 45;                 // 已知匿名代理/VPN 出口
   if (hosting) risk += 25;               // 机房/数据中心
   if (kind === 'business') risk += 6;
-  if (HOSTING_KEYWORDS.test(orgText)) risk += 15; // ASN/ISP 命中托管或 VPN 关键词
-  if (mobile) risk = Math.max(0, risk - 20);      // 蜂窝网络更接近住宅, 减分
-  // 不因 type=isp/residential 单一标签直接判定 100 分；缺少风险信号不等于已验证住宅纯净。
+  if (HOSTING_KEYWORDS.test(orgText)) risk += 15; // ISP/ORG/AS 命中托管或 VPN 关键词
+  if (mobile) risk = Math.max(0, risk - 20);      // 移动网络风险减 20
+  // 普通住宅/运营商 ISP 仅在未命中代理、机房时封顶风险 10；不将其直接视为 100 分。
+  const ordinaryIsp = (kind === 'isp' || kind === 'residential') && !proxy && !hosting;
+  if (ordinaryIsp) risk = Math.min(risk, 10);
   risk = Math.max(0, Math.min(100, risk));
   const clean = 100 - risk;
   let grade = 'clean';
