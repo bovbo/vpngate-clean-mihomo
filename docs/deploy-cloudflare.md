@@ -21,6 +21,8 @@ cp wrangler.sstp.toml.example wrangler.sstp.toml
 npx wrangler@4 deploy --config wrangler.sstp.toml
 ~~~
 
+配置中的 name 必须与现有 SSTP Worker 的服务名一致，才能更新原服务；若保留示例名，会新建一个 Worker，不会自动接管 gat.liee.ipv64.net。若要使用 gat.liee.ipv64.net，需确认域名当前没有绑定到其他 Worker，再在配置中启用对应 routes，或在 Cloudflare Dashboard 将自定义域名绑定到目标 Worker。
+
 部署后打开 Worker 的 /run，执行首次检测。首次检测可能需要多轮续跑；/status 可查看进度，/data.json 查看完整检测结果，/nodes.txt 查看只包含已识别住宅/运营商出口的发布文本。
 
 配置中的 Cron 每 10 分钟触发一次；存在未完成任务时继续执行，没有未完成任务时按 INTERVAL_MINUTES=60 每小时启动新检测。请将 CHECK_WORKER 改为实际可用的探测 Worker 地址。
@@ -57,4 +59,4 @@ npx wrangler@4 deploy
 
 ## 5. 自动检查
 
-仓库的 GitHub Actions 会在推送到 main 后检查三个 Worker 的 JavaScript 语法、Python 语法和 shell 语法。该检查不替代 Cloudflare 实际部署后的 KV、Cron、上游可达性和真实节点验收。
+仓库的 GitHub Actions 会在推送到 main 后检查三个 Worker 的 JavaScript 语法、Python 语法、shell 语法，并对两个 Wrangler 配置执行 dry-run 打包。该检查不替代 Cloudflare 实际部署后的 KV、Cron、上游可达性和真实节点验收。
