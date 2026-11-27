@@ -1,62 +1,68 @@
 # Cloudflare Workers 部署与上线验收
 
-本项目的 SSTP 发布链路由独立 Worker 组成。生产者与所有读取端必须绑定同一个 Cloudflare KV namespace，否则 /nodes.txt 和 SSTP 数据不会共享。
+## 最终架构：只部署两个 Worker
 
-## 1. 创建共享 KV
+1. **主 Worker：** `worker/worker.js`。它同时提供原有节点浏览器、OpenVPN API/订阅，以及 SSTP 检测、KV 存储、`/nodes.txt` 发布和手动运行页面。SSTP 逻辑已合并进主 Worker，不再部署独立的 `VPN Gate-worker.js`。
+2. **检测 Worker：** `_worker - 副本.js`。这是 SSTP 探测依赖，保持原样，不修改、不合并，也不替换。
 
-在 Cloudflare Dashboard → Workers & Pages → KV 创建一个 namespace，例如 GATE_DATA，复制它的 Namespace ID。
+不要部署第三个 SSTP Publisher Worker。
 
-把同一个 ID 填入：
-- wrangler.sstp.toml 的 KV 绑定；
-- 如主节点 Worker 需要聚合 SSTP，在 worker/wrangler.toml 中取消注释 KV 绑定并填同一个 ID；
-- 你自己的外部消费 Worker 也绑定同一个 namespace，binding 名称使用它代码要求的名称（本项目主 Worker 使用 GATE_KV）。
+## 1. KV
 
-不要为生产者和消费者分别创建不同 namespace。
+主 Worker 需要一个 KV namespace，binding 名称必须为 `GATE_KV`。如果你已经有存放 SSTP 数据的 namespace，继续使用原来的 Namespace ID，不要另建一个导致旧数据分离。
 
-## 2. 部署 SSTP 发布 Worker
+## 2. 配置并部署唯一主 Worker
+
+在 `worker/` 目录：
 
 ~~~bash
-cp wrangler.sstp.toml.example wrangler.sstp.toml
-# 编辑 wrangler.sstp.toml：将 REPLACE_WITH_KV_NAMESPACE_ID 替换为真实 ID
-npx wrangler@4 deploy --config wrangler.sstp.toml
+cp wrangler.toml.example wrangler.toml
 ~~~
 
-配置中的 name 必须与现有 SSTP Worker 的服务名一致，才能更新原服务；若保留示例名，会新建一个 Worker，不会自动接管 gat.liee.ipv64.net。若要使用 gat.liee.ipv64.net，需确认域名当前没有绑定到其他 Worker，再在配置中启用对应 routes，或在 Cloudflare Dashboard 将自定义域名绑定到目标 Worker。
+编辑 `wrangler.toml`：
+- 将 `REPLACE_WITH_KV_NAMESPACE_ID` 替换为现有 GATE_KV namespace ID；
+- 将 `CHECK_WORKER` 改为你现有检测 Worker 的实际域名（即 `_worker - 副本.js` 对应的地址）；
+- 将 `name` 改成你当前主 Worker 的 Cloudflare 服务名，确保更新现有 Worker，而不是新建一个服务。
 
-部署后打开 Worker 的 /run，执行首次检测。首次检测可能需要多轮续跑；/status 可查看进度，/data.json 查看完整检测结果，/nodes.txt 查看只包含已识别住宅/运营商出口的发布文本。
-
-配置中的 Cron 每 10 分钟触发一次；存在未完成任务时继续执行，没有未完成任务时按 INTERVAL_MINUTES=60 每小时启动新检测。请将 CHECK_WORKER 改为实际可用的探测 Worker 地址。
-
-生产环境必须设置 TOKEN，避免任何人都能调用 /api/step 消耗 Worker 子请求额度。部署后执行：
-
-~~~bash
-npx wrangler@4 secret put TOKEN --config wrangler.sstp.toml
-~~~
-
-输入一段随机生成的长令牌；打开 /run 手动执行时，在页面输入同一个令牌。不要把令牌写进 wrangler 配置、仓库或公开变量。
-
-## 3. 部署主节点 Worker（可选）
+部署：
 
 ~~~bash
-cp worker/wrangler.toml.example worker/wrangler.toml
-# 如需 SSTP 聚合，取消注释 KV 绑定并填入同一个 namespace ID
 cd worker
 npx wrangler@4 deploy
 ~~~
 
-主 Worker 的 /api/nodes 会聚合 OpenVPN 与 KV 中的 SSTP 节点；SSTP 出口 IP 会进入同一质量画像流程。质量源不可用时节点仍返回，质量字段保持未知，不会伪造分数。
+生产环境设置手动检测令牌：
+
+~~~bash
+npx wrangler@4 secret put TOKEN
+~~~
+
+输入随机生成的长令牌。访问主 Worker 的 `/run` 时在页面填写同一个令牌。
+
+## 3. 合并后的路由
+
+| 路径 | 功能 |
+|---|---|
+| `/` | 原有节点浏览器 |
+| `/api/servers` | 原有 OpenVPN 节点 API |
+| `/api/nodes` | OpenVPN + SSTP 统一节点 API，包含风险评分 |
+| `/sub`、`/mihomo` 等 | 原有 OpenVPN 订阅功能 |
+| `/run` | SSTP 手动检测页面 |
+| `/api/step` | SSTP 分批检测执行入口（受 TOKEN 保护） |
+| `/status` | SSTP 检测进度 |
+| `/data.json` | SSTP 完整检测数据 |
+| `/nodes.txt` | 只发布已识别住宅/运营商出口的 SSTP 文本 |
+
+Cron 每 10 分钟触发一次：有未完成任务则续跑；没有任务时按 `INTERVAL_MINUTES=60` 每小时启动新一轮。检测 Worker 仅作为 `CHECK_WORKER` 指向的探测依赖，不承担 SSTP 发布或 KV 存储。
 
 ## 4. 上线验收
 
-逐项检查，不要把 HTTP 200 当作整个链路已验收：
+1. 主 Worker 的 `/` 正常显示原有节点浏览器。
+2. `/run` 可打开；设置 TOKEN 后能启动检测。
+3. `/status` 显示运行状态；检测完成后 `/data.json` 有结果。
+4. `/nodes.txt` 非空，格式为 `优选入口#节点备注$sstp://vpn:vpn@真实SSTP服务器:端口`。
+5. `nodes.txt` 只包含 `residential="residential"` 的节点；机房和 unknown 仍保留在 `data.json` 和节点浏览器数据中。
+6. `/api/nodes` 返回 OpenVPN 与 SSTP；SSTP 有可用质量画像时返回 `quality.clean` / `quality.risk`，质量源无结果时分数保持 `null`。
+7. 原有 `/api/servers`、`/sub`、`/mihomo` 继续正常。
 
-1. SSTP Worker 的 /status 显示检测已完成，且 /data.json 的 stats.success 大于 0。
-2. SSTP Worker 的 /nodes.txt 非空；每行格式为 优选入口#节点备注$sstp://vpn:vpn@真实SSTP服务器:端口。
-3. 发布文本只包含 residential="residential" 的节点；机房和 unknown 仍留在 /data.json。
-4. 外部消费 Worker 绑定相同 KV namespace 后，读取到同样的 nodes.txt。
-5. 主 Worker 若启用 SSTP，访问 /api/nodes，确认 sources.sstp.available=true，并检查 SSTP 节点的 quality.clean / quality.risk。若 IP 质量源对某出口无结果，分数应为 null，不能当作 100 分。
-6. 检查主 Worker 原有 /、/api/servers、/sub 仍正常。
-
-## 5. 自动检查
-
-仓库的 GitHub Actions 会在推送到 main 后检查三个 Worker 的 JavaScript 语法、Python 语法、shell 语法，并对两个 Wrangler 配置执行 dry-run 打包。该检查不替代 Cloudflare 实际部署后的 KV、Cron、上游可达性和真实节点验收。
+GitHub Actions 的语法检查和 Wrangler dry-run 只能证明代码可解析、可打包；以上 HTTP、KV、Cron 和真实节点检查必须在 Cloudflare 部署后完成。
