@@ -1196,11 +1196,11 @@ function createSstpClient(proxy) {
 		}
 
 		try {
+			if (proxy?._sstpDiagnostics) proxy._sstpDiagnostics.stage = 'socket_connecting';
 			socket = connect(
 				{ hostname: serverHost, port: serverPort },
 				{ secureTransport: 'on', allowHalfOpen: false }
 			);
-			if (proxy?._sstpDiagnostics) proxy._sstpDiagnostics.stage = 'socket_connecting';
 			await withTimeout(socket.opened, CONNECT_TIMEOUT_MS, 'SSTP server connection timed out');
 			if (proxy?._sstpDiagnostics) proxy._sstpDiagnostics.stage = 'socket_connected';
 		} catch (error) {
