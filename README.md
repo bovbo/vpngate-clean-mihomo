@@ -5,7 +5,7 @@
 </p>
 
 
-一个**单文件 Cloudflare Worker**：实时抓取 [VPN Gate](https://www.vpngate.net)（筑波大学学术实验项目）的公共 OpenVPN 节点，
+项目采用**两个 Cloudflare Worker**：主 Worker（`worker/worker.js`）整合节点浏览器、OpenVPN 与 SSTP 检测/发布；探测 Worker（`_worker - 副本.js`）只负责 SSTP 连通性探测，保持独立。主 Worker 实时抓取 [VPN Gate](https://www.vpngate.net)（筑波大学学术实验项目）的公共 OpenVPN 节点，
 **自动检测每个出口 IP 的“纯净度 / 欺诈风险”**，在网页上浏览筛选，并直接输出一份可订阅的
 [Mihomo（Clash.Meta 内核）](https://wiki.metacubex.one/config/proxies/openvpn/) 配置——支持“只给干净住宅 IP”的纯净订阅。
 
@@ -49,7 +49,7 @@
 - 🖥️ **可选 VPS 转换层**：固定客户端入口 + 后台自动优选干净出口 + 看门狗故障切换 + IPv6 黑洞防泄漏；
   支持 10 国多地区槽位（国家粘性绑定、按实测出口国验收），订阅统一生成、刷新不跳旗。
 - 🧰 **运维配套**：完整 10 步部署教程、端到端拨测引擎、Telegram 掌上控制台（均在 `docs/`、`extras/`）。
-- ⚡ 质量画像 6 小时内存缓存、节点列表边缘缓存；质量源故障自动降级，**绝不阻断出节点**。无需 KV / D1 / 环境变量。
+- ⚡ 质量画像 6 小时缓存、节点列表边缘缓存；质量源故障自动降级。SSTP 检测结果与 `nodes.txt` 使用主 Worker 绑定的 KV 持久化。
 
 ### 继承自原项目
 - 节点浏览器：国家旗帜、主机/IP、评分、Ping 色点、速度条、在线人数、运行时长、流量、运营者、说明、TCP/UDP 徽章；
@@ -61,13 +61,18 @@
 ## 🧩 工作原理
 
 ```
-                         ┌──────────────────────────── Cloudflare Worker ───────────────────────────┐
+                         ┌──────────────────────────── 主 Cloudflare Worker ───────────────────────┐
  VPNGate 官方 CSV ──────▶│ 解析节点 → 提取出口IP → IP质量画像(ip-api 批量,缓存6h) → 打分 clean/risk  │
  (www.vpngate.net/api)   │                                                                          │
                          │   GET /            节点浏览器(表格带“纯净度”列)                           │
                          │   GET /api/servers 全部节点 JSON(带 quality 字段)                        │
                          │   GET /sub         按参数筛选/排序 → 完整 Mihomo 订阅(逐节点标注风险)     │
+                         │   GET /run        SSTP 检测控制台 / GET /nodes.txt 发布文本              │
+                         │   Cron            自动续跑 / 定时刷新 SSTP 节点                          │
                          └──────────────────────────────────────────────────────────────────────────┘
+                                           │ /check 探测请求
+                                           ▼
+                                  _worker - 副本.js（探测 Worker，不修改）
                                                               │ 纯净订阅 URL
                                                               ▼
                                               Mihomo / ClashMeta 客户端自动测速选优
@@ -99,9 +104,10 @@
 ## 🚀 快速开始（只用 Worker，5 分钟）
 
 ### 方式 A：控制台粘贴（零依赖）
-1. 登录 [Cloudflare Dashboard](https://dash.cloudflare.com/) → Workers & Pages → 创建 Worker。
-2. 把 [`worker/worker.js`](worker/worker.js) 全部内容粘贴进在线编辑器，部署。
-3. 访问分配的 `*.workers.dev` 地址即可看到节点浏览器。
+1. 先部署现有探测 Worker：[`_worker - 副本.js`](_worker%20-%20%E5%89%AF%E6%9C%AC.js)，它只负责 SSTP `/check` 探测，不需要改代码。
+2. 部署主 Worker：把 [`worker/worker.js`](worker/worker.js) 全部内容粘贴进 Cloudflare Worker。
+3. 主 Worker 绑定 KV（变量名 `GATE_KV`），并设置 `CHECK_WORKER` 为探测 Worker 的域名；如需定时刷新，配置 Cron `*/10 * * * *`。
+4. 访问主 Worker 域名即可使用节点浏览器、SSTP `/run` 和 `/nodes.txt`。不需要部署独立的 `VPN Gate-worker.js`。
 
 ### 方式 B：Wrangler CLI
 ```bash
@@ -168,8 +174,9 @@ https://你的域名/sub?cc=JP&n=10&maxrisk=30&sort=clean
 ```
 .
 ├── worker/
-│   ├── worker.js                 # 单文件 Worker（节点浏览器 + API + 订阅 + 质量引擎）
+│   ├── worker.js                 # 唯一主 Worker（浏览器 + OpenVPN + SSTP 检测/发布）
 │   └── wrangler.toml.example
+├── _worker - 副本.js             # 独立探测 Worker（保持不动）
 ├── vps-relay/                    # 可选：VPS 自动优选 + 固定入口转换层
 │   ├── bestip_refresh.py/.sh     # 日本槽纯净优选器（Worker 优先，官方 CSV 兜底）
 │   ├── build_running.sh          # 由候选拼出 running.ovpn（缺失时自举）
