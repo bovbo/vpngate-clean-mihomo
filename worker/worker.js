@@ -45,6 +45,29 @@ export default {
     const url = new URL(request.url);
     const p = url.pathname.replace(/\/+$/, '') || '/';
     try {
+      if (p === '/nodes.txt') {
+        if (!env.GATE_KV) {
+          return new Response('GATE_KV 未绑定：请将 VPN Gate-worker.js 使用的同一个 KV namespace 绑定到主 Worker，变量名设为 GATE_KV。', {
+            status: 503,
+            headers: { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' },
+          });
+        }
+        const nodes = await env.GATE_KV.get('nodes.txt');
+        if (nodes === null) {
+          return new Response('nodes.txt 尚未生成：请先运行 VPN Gate-worker.js 的检测任务。', {
+            status: 503,
+            headers: { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' },
+          });
+        }
+        return new Response(nodes, {
+          headers: {
+            'content-type': 'text/plain; charset=utf-8',
+            'content-disposition': 'inline; filename="nodes.txt"',
+            'cache-control': 'public, max-age=60',
+            'access-control-allow-origin': '*',
+          },
+        });
+      }
       if (p === '/api/servers') return await handleServersApi(request, ctx);
       if (p === '/sub' || p === '/mihomo' || p === '/clash' || p === '/subscribe') {
         return await handleSubscription(url, ctx);
