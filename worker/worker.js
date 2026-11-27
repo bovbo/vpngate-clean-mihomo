@@ -69,6 +69,7 @@ export default {
         });
       }
       if (p === '/api/servers') return await handleServersApi(request, ctx);
+      if (p === '/api/nodes') return await handleUnifiedNodesApi(request, env, ctx);
       if (p === '/sub' || p === '/mihomo' || p === '/clash' || p === '/subscribe') {
         return await handleSubscription(url, ctx);
       }
@@ -123,6 +124,104 @@ async function getServers(ctx, force) {
     if (stale) return { servers: parseVpnGateCsv(await stale.text()), cached: true, stale: true };
     throw new Error('vpngate.net 拉取失败(' + (err && err.message) + ')且无可用缓存');
   }
+}
+
+// 统一节点 API：OpenVPN 为基础来源，SSTP 为可选来源；任一可选来源故障不阻断基础列表。
+async function handleUnifiedNodesApi(request, env, ctx) {
+  const u = new URL(request.url);
+  const includeSstp = u.searchParams.get('sstp') !== '0';
+  const { servers, cached } = await getServers(ctx, u.searchParams.get('refresh') === '1');
+  try { await enrichQuality(servers, ctx); } catch (e) {}
+  const nodes = servers.map((s) => ({
+    id: 'openvpn:' + String(s.ip || s.hostName || ''),
+    source: 'vpngate-openvpn',
+    protocol: 'openvpn',
+    host: s.hostName || s.ip,
+    ip: s.ip || null,
+    port: null,
+    country_code: (s.countryShort || '').toUpperCase(),
+    country: s.countryLong || '',
+    online: true,
+    latency_ms: Number.isFinite(Number(s.ping)) && Number(s.ping) > 0 ? Number(s.ping) : null,
+    score: Number(s.score) || 0,
+    speed_bps: Number(s.speed) || 0,
+    sessions: Number(s.numSessions) || 0,
+    uptime_seconds: Number(s.uptime) || 0,
+    total_users: Number(s.totalUsers) || 0,
+    total_traffic: Number(s.totalTraffic) || 0,
+    operator: s.operator || '',
+    message: s.message || '',
+    transport: s.logType || '',
+    quality: s._q || null,
+    capabilities: { mihomo_openvpn: true, homeproxy: false, v2rayn: false },
+    checked_at: null,
+  }));
+  const sources = {
+    openvpn: { enabled: true, available: true, cached, count: nodes.length },
+    sstp: { enabled: includeSstp && Boolean(env.GATE_KV), available: false, count: 0 },
+  };
+  if (includeSstp && env.GATE_KV) {
+    try {
+      const raw = await env.GATE_KV.get('data.json');
+      const data = typeof raw === 'string' ? JSON.parse(raw) : raw;
+      if (data && data.countries && typeof data.countries === 'object') {
+        const sstpNodes = [];
+        for (const [code, group] of Object.entries(data.countries)) {
+          for (const n of (group && Array.isArray(group.nodes) ? group.nodes : [])) {
+            if (!n || !n.host || !Number(n.port)) continue;
+            const exit = n.exit || {};
+            sstpNodes.push({
+              id: 'sstp:' + String(n.host).toLowerCase() + ':' + Number(n.port),
+              source: 'vpngate-sstp',
+              protocol: 'sstp',
+              host: n.host,
+              ip: exit.ip || n.ip || null,
+              port: Number(n.port),
+              country_code: String(exit.country_code || n.country_code || code).toUpperCase(),
+              country: exit.country || n.country || group.name || code,
+              online: n.success === true,
+              latency_ms: Number.isFinite(Number(n.latency_ms)) ? Number(n.latency_ms) : (Number.isFinite(Number(n.ping)) ? Number(n.ping) : null),
+              score: Number(n.score) || 0,
+              speed_bps: null,
+              sessions: null,
+              uptime_seconds: null,
+              total_users: null,
+              total_traffic: null,
+              operator: exit.org || '',
+              message: n.error || '',
+              transport: 'TCP',
+              quality: {
+                kind: n.residential || 'unknown',
+                proxy: null,
+                hosting: n.residential === 'datacenter',
+                mobile: null,
+                clean: null,
+                risk: null,
+                isp: exit.org || '',
+              },
+              capabilities: { mihomo_openvpn: false, homeproxy: false, v2rayn: false, sstp_client_required: true },
+              checked_at: data.generated_at || null,
+            });
+          }
+        }
+        nodes.push(...sstpNodes);
+        sources.sstp = { enabled: true, available: true, count: sstpNodes.length, generated_at: data.generated_at || null };
+      } else {
+        sources.sstp = { enabled: true, available: false, count: 0, reason: 'SSTP 数据尚未生成或格式无效' };
+      }
+    } catch (e) {
+      sources.sstp = { enabled: true, available: false, count: 0, reason: 'SSTP 数据暂时不可用' };
+    }
+  } else if (includeSstp) {
+    sources.sstp.reason = '未配置可选 GATE_KV，已跳过 SSTP 来源';
+  }
+  return jsonResponse({
+    schema_version: 1,
+    updated_at: new Date().toISOString(),
+    count: nodes.length,
+    sources,
+    nodes,
+  }, 200, 30);
 }
 
 async function handleServersApi(request, ctx) {
