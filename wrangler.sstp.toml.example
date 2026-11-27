@@ -1,0 +1,22 @@
+# SSTP 节点检测与 nodes.txt 发布 Worker
+# 部署前复制为 wrangler.sstp.toml，并填入真实 KV namespace ID。
+name = "vpngate-sstp-publisher"
+main = "VPN Gate-worker.js"
+compatibility_date = "2026-07-08"
+
+# 每 10 分钟触发一次：有未完成任务则续跑；没有任务时每 60 分钟开始新一轮。
+[triggers]
+crons = ["*/10 * * * *"]
+
+[vars]
+INTERVAL_MINUTES = "60"
+STEP_SECONDS = "300"
+CHECK_CONCURRENCY = "6"
+SUBREQUEST_LIMIT = "45"
+# 按实际探测 Worker 域名修改；可只填 host。
+CHECK_WORKER = "check.boxo.eu.org"
+
+# 必须绑定 KV；main Worker 和外部消费 Worker 也要绑定同一个 namespace。
+[[kv_namespaces]]
+binding = "GATE_KV"
+id = "REPLACE_WITH_KV_NAMESPACE_ID"
