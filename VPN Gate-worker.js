@@ -591,12 +591,12 @@ function prioritize(nodes) {
 // ---------------------------------------------------------------------------
 function classifyNetwork(org, isDatacenter) {
   if (isDatacenter === true) return "datacenter";
-  if (isDatacenter === false) return "residential";
   const upper = (org || "").toUpperCase();
   if (upper) {
     if (DATA_CENTER_ORG_KEYWORDS.some((k) => upper.includes(k))) return "datacenter";
     if (RESIDENTIAL_ORG_KEYWORDS.some((k) => upper.includes(k))) return "residential";
   }
+  // is_datacenter=false 只表示未标记为机房，不足以证明是住宅/运营商网络。
   return "unknown";
 }
 
@@ -821,12 +821,9 @@ function buildNodesText(data, edgeHosts, cfg) {
   for (const [code, group] of ordered) {
     const name = COUNTRY_ZH[code] || group.name || code;
     const nodes = [...group.nodes].sort((a, b) => compareTuples(nodeSortKey(a), nodeSortKey(b)));
+    // nodes.txt 只发布已识别为住宅/运营商网络的节点；机房与未知节点仍保留在 data.json 供浏览器查看。
     const residential = nodes.filter((n) => n.residential === "residential");
-    const others = nodes.filter((n) => n.residential !== "residential");
-    const chosen = [
-      ...residential.slice(0, cfg.maxResidentialPerCountry),
-      ...others.slice(0, cfg.maxDatacenterPerCountry),
-    ];
+    const chosen = residential.slice(0, cfg.maxResidentialPerCountry);
     const counters = { residential: 0, datacenter: 0, unknown: 0 };
     for (const node of chosen) {
       const link = `sstp://vpn:vpn@${node.host}:${node.port}`;
