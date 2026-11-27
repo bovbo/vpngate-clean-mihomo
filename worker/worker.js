@@ -137,13 +137,62 @@ async function handleUnifiedNodesApi(request, env, ctx) {
   const u = new URL(request.url);
   const includeSstp = u.searchParams.get('sstp') !== '0';
   const { servers, cached } = await getServers(ctx, u.searchParams.get('refresh') === '1');
-  try {
-    await enrichQuality(servers, ctx);
-  } catch (e) {
-    // 质量画像是增强信息；失败时保留基础节点，并记录诊断信息。
-    console.warn('[api/nodes] 质量画像增强失败，已降级继续返回节点：', e && e.message ? e.message : e);
-    for (const server of servers) server._q = server._q || null;
+  let sstpRawNodes = [];
+  let sstpSource = {
+    enabled: includeSstp && Boolean(env.GATE_KV),
+    available: false,
+    count: 0,
+  };
+
+  // SSTP 是可选来源：KV/数据格式异常不能影响 OpenVPN 基础节点。
+  if (includeSstp && env.GATE_KV) {
+    try {
+      const raw = await env.GATE_KV.get('data.json');
+      const data = typeof raw === 'string' ? JSON.parse(raw) : raw;
+      if (data && data.countries && typeof data.countries === 'object') {
+        for (const [code, group] of Object.entries(data.countries)) {
+          for (const n of (group && Array.isArray(group.nodes) ? group.nodes : [])) {
+            if (!n || !n.host || !Number(n.port)) continue;
+            const exit = n.exit || {};
+            sstpRawNodes.push({
+              _sourceNode: n,
+              _exit: exit,
+              ip: exit.ip || n.ip || null,
+              host: n.host,
+              port: Number(n.port),
+              country_code: String(exit.country_code || n.country_code || code).toUpperCase(),
+              country: exit.country || n.country || group.name || code,
+            });
+          }
+        }
+        sstpSource = {
+          enabled: true,
+          available: sstpRawNodes.length > 0,
+          count: sstpRawNodes.length,
+          generated_at: data.generated_at || null,
+          ...(sstpRawNodes.length ? {} : { reason: 'SSTP 检测结果中暂无可用节点' }),
+        };
+      } else {
+        sstpSource = { enabled: true, available: false, count: 0, reason: 'SSTP 数据尚未生成或格式无效' };
+      }
+    } catch (e) {
+      console.warn('[api/nodes] SSTP 可选来源读取失败：', e && e.message ? e.message : e);
+      sstpSource = { enabled: true, available: false, count: 0, reason: 'SSTP 数据暂时不可用' };
+      sstpRawNodes = [];
+    }
+  } else if (includeSstp) {
+    sstpSource.reason = '未配置可选 GATE_KV，已跳过 SSTP 来源';
   }
+
+  // OpenVPN 与 SSTP 出口 IP 共用一次画像流程，避免 SSTP 节点长期只有分类标签而没有 risk/clean。
+  const qualityTargets = servers.concat(sstpRawNodes.filter((n) => n.ip));
+  try {
+    await enrichQuality(qualityTargets, ctx);
+  } catch (e) {
+    console.warn('[api/nodes] 质量画像增强失败，已降级继续返回节点：', e && e.message ? e.message : e);
+    for (const server of qualityTargets) server._q = server._q || null;
+  }
+
   const nodes = servers.map((s) => ({
     id: 'openvpn:' + String(s.ip || s.hostName || ''),
     source: 'vpngate-openvpn',
@@ -169,77 +218,75 @@ async function handleUnifiedNodesApi(request, env, ctx) {
     capabilities: { mihomo_openvpn: true, homeproxy: false, v2rayn: false },
     checked_at: null,
   }));
-  const sources = {
-    openvpn: { enabled: true, available: true, cached, count: nodes.length },
-    sstp: { enabled: includeSstp && Boolean(env.GATE_KV), available: false, count: 0 },
-  };
-  if (includeSstp && env.GATE_KV) {
-    try {
-      const raw = await env.GATE_KV.get('data.json');
-      const data = typeof raw === 'string' ? JSON.parse(raw) : raw;
-      if (data && data.countries && typeof data.countries === 'object') {
-        const sstpNodes = [];
-        for (const [code, group] of Object.entries(data.countries)) {
-          for (const n of (group && Array.isArray(group.nodes) ? group.nodes : [])) {
-            if (!n || !n.host || !Number(n.port)) continue;
-            const exit = n.exit || {};
-            sstpNodes.push({
-              id: 'sstp:' + String(n.host).toLowerCase() + ':' + Number(n.port),
-              source: 'vpngate-sstp',
-              protocol: 'sstp',
-              host: n.host,
-              ip: exit.ip || n.ip || null,
-              port: Number(n.port),
-              country_code: String(exit.country_code || n.country_code || code).toUpperCase(),
-              country: exit.country || n.country || group.name || code,
-              online: n.success === true,
-              latency_ms: n.latency_ms != null && Number.isFinite(Number(n.latency_ms)) ? Number(n.latency_ms) : (n.ping != null && Number.isFinite(Number(n.ping)) ? Number(n.ping) : null),
-              score: Number(n.score) || 0,
-              speed_bps: null,
-              sessions: null,
-              uptime_seconds: null,
-              total_users: null,
-              total_traffic: null,
-              operator: exit.org || '',
-              message: n.error || '',
-              transport: 'TCP',
-              quality: {
-                kind: n.residential || 'unknown',
-                proxy: null,
-                hosting: n.residential === 'datacenter',
-                mobile: null,
-                clean: null,
-                risk: null,
-                isp: exit.org || '',
-              },
-              capabilities: { mihomo_openvpn: false, homeproxy: false, v2rayn: false, sstp_client_required: true },
-              checked_at: data.generated_at || null,
-            });
-          }
-        }
-        nodes.push(...sstpNodes);
-        sources.sstp = {
-          enabled: true,
-          available: sstpNodes.length > 0,
-          count: sstpNodes.length,
-          generated_at: data.generated_at || null,
-          ...(sstpNodes.length ? {} : { reason: 'SSTP 检测结果中暂无可用节点' }),
-        };
-      } else {
-        sources.sstp = { enabled: true, available: false, count: 0, reason: 'SSTP 数据尚未生成或格式无效' };
+
+  const sstpNodes = sstpRawNodes.map((s) => {
+    const n = s._sourceNode;
+    const exit = s._exit;
+    const q = s._q || null;
+    const networkKind = n.residential || 'unknown';
+    let quality = q ? { ...q } : {
+      kind: networkKind,
+      proxy: null,
+      hosting: networkKind === 'datacenter',
+      mobile: null,
+      clean: null,
+      risk: null,
+      isp: exit.org || '',
+    };
+
+    // SSTP 检测 Worker 的 is_datacenter/运营商分类是独立信号，补入统一风险分；
+    // 已确认的住宅 ISP 在非代理、非机房前提下执行风险封顶 10。
+    if (q) {
+      let risk = Number(q.risk);
+      if (networkKind === 'datacenter' && !q.hosting) {
+        risk += 25;
+        quality.hosting = true;
       }
-    } catch (e) {
-      console.warn('[api/nodes] SSTP 可选来源读取失败：', e && e.message ? e.message : e);
-      sources.sstp = { enabled: true, available: false, count: 0, reason: 'SSTP 数据暂时不可用' };
+      if (networkKind === 'residential' && !q.proxy && !quality.hosting) {
+        risk = Math.min(risk, 10);
+      }
+      risk = Math.max(0, Math.min(100, risk));
+      quality.risk = risk;
+      quality.clean = 100 - risk;
+      quality.grade = quality.clean < 50 ? 'risk' : quality.clean < 80 ? 'mid' : 'clean';
+      if (!quality.isp) quality.isp = exit.org || '';
     }
-  } else if (includeSstp) {
-    sources.sstp.reason = '未配置可选 GATE_KV，已跳过 SSTP 来源';
-  }
+
+    return {
+      id: 'sstp:' + String(s.host).toLowerCase() + ':' + s.port,
+      source: 'vpngate-sstp',
+      protocol: 'sstp',
+      host: s.host,
+      ip: s.ip,
+      port: s.port,
+      country_code: s.country_code,
+      country: s.country,
+      online: n.success === true,
+      latency_ms: n.latency_ms != null && Number.isFinite(Number(n.latency_ms)) ? Number(n.latency_ms) : (n.ping != null && Number.isFinite(Number(n.ping)) ? Number(n.ping) : null),
+      score: Number(n.score) || 0,
+      speed_bps: null,
+      sessions: null,
+      uptime_seconds: null,
+      total_users: null,
+      total_traffic: null,
+      operator: exit.org || '',
+      message: n.error || '',
+      transport: 'TCP',
+      quality,
+      capabilities: { mihomo_openvpn: false, homeproxy: false, v2rayn: false, sstp_client_required: true },
+      checked_at: null,
+    };
+  });
+  nodes.push(...sstpNodes);
+
   return jsonResponse({
     schema_version: 1,
     updated_at: new Date().toISOString(),
     count: nodes.length,
-    sources,
+    sources: {
+      openvpn: { enabled: true, available: true, cached, count: servers.length },
+      sstp: { ...sstpSource, count: sstpNodes.length },
+    },
     nodes,
   }, 200, 30);
 }
