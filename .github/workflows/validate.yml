@@ -32,3 +32,10 @@ jobs:
           while IFS= read -r -d '' file; do
             bash -n "$file"
           done < <(find vps-relay -type f -name '*.sh' -print0)
+      - name: Bundle Workers with Wrangler (dry run)
+        run: |
+          cp wrangler.sst.toml.example .wrangler-ci-sstp.toml
+          sed -i '/^\[\[kv_namespaces\]\]/,$d' .wrangler-ci-sstp.toml
+          npx --yes wrangler@4 deploy --dry-run --config .wrangler-ci-sstp.toml
+          npx --yes wrangler@4 deploy --dry-run --config worker/wrangler.toml.example
+          rm -f .wrangler-ci-sstp.toml
