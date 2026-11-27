@@ -26,7 +26,7 @@
 // ---------------------------------------------------------------------------
 const SCHEMA_VERSION = 1;
 
-// 检测 Worker 默认值（可用环境变量 CHECK_WORKER 或 DOMAIN 覆盖）
+// 检测 Worker 默认域名；可用 CHECK_WORKER 覆盖。DOMAIN 仅用于主站域名。
 const DEFAULT_DOMAIN = "check.boxo.eu.org";
 
 // VPN Gate 没有 HTTPS 接口，官方 API 只提供 HTTP。
@@ -176,11 +176,11 @@ function envFloat(env, name, def, minimum = 0) {
 function normalizeWorkerBase(raw) {
   let value = (raw || "").trim();
   if (!value) {
-    throw new ConfigError("未配置检测 Worker 地址。请设置环境变量 CHECK_WORKER 或 DOMAIN（只填 host，例如 check.example.net）。");
+    throw new ConfigError("未配置检测 Worker 地址。请设置环境变量 CHECK_WORKER（例如 https://check.boxo.eu.org/check?sstp=vpn:vpn@）。");
   }
   const lowered = value.toLowerCase();
   if (PLACEHOLDER_MARKERS.some((m) => lowered.includes(m.toLowerCase()))) {
-    throw new ConfigError("检测地址仍是占位符。请把环境变量 DOMAIN 设成真实的检测 Worker host。");
+    throw new ConfigError("检测地址仍是占位符。请把环境变量 CHECK_WORKER 设成真实的检测 Worker 地址。");
   }
   if (!/^[A-Za-z][A-Za-z0-9+.-]*:\/\//.test(value)) value = "https://" + value;
   let url;
@@ -258,11 +258,11 @@ function parseEdgeHosts(raw) {
 }
 
 function loadConfig(env) {
-  let rawWorker = envStr(env, "CHECK_WORKER");
-  if (!rawWorker) {
-    const domain = envStr(env, "DOMAIN", DEFAULT_DOMAIN).replace(/^https?:\/\//i, "").replace(/\/.*$/, "");
-    rawWorker = `https://${domain}/check?sstp=vpn:vpn@`;
-  }
+  const rawWorker = envStr(
+    env,
+    "CHECK_WORKER",
+    `https://${DEFAULT_DOMAIN}/check?sstp=vpn:vpn@`
+  );
   const workerBase = normalizeWorkerBase(rawWorker);
 
   let staticRaw = envStr(env, "HOSTS_ENTRY");
