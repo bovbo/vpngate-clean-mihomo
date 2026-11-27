@@ -1863,7 +1863,7 @@ export default {
         const store = getKV(env);
         const [rawData, rawHosts] = await Promise.all([store.get("data.json", "json"), store.get("edge-hosts.json", "json")]);
         if (!rawData || !Array.isArray(rawHosts)) {
-          return textResponse("尚未生成纯净订阅：请先打开 /run 执行一次检测\\n", "text/plain; charset=utf-8", 404, NO_CACHE);
+          return textResponse("尚未生成纯净订阅：请先打开 /run 执行一次检测\n", "text/plain; charset=utf-8", 404, NO_CACHE);
         }
         const parsed = Number.parseInt(url.searchParams.get("maxrisk") || "50", 10);
         const maxRisk = Number.isFinite(parsed) ? Math.max(0, Math.min(100, parsed)) : 50;
