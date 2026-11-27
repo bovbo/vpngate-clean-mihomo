@@ -181,7 +181,7 @@ async function handleUnifiedNodesApi(request, env, ctx) {
               country_code: String(exit.country_code || n.country_code || code).toUpperCase(),
               country: exit.country || n.country || group.name || code,
               online: n.success === true,
-              latency_ms: Number.isFinite(Number(n.latency_ms)) ? Number(n.latency_ms) : (Number.isFinite(Number(n.ping)) ? Number(n.ping) : null),
+              latency_ms: n.latency_ms != null && Number.isFinite(Number(n.latency_ms)) ? Number(n.latency_ms) : (n.ping != null && Number.isFinite(Number(n.ping)) ? Number(n.ping) : null),
               score: Number(n.score) || 0,
               speed_bps: null,
               sessions: null,
