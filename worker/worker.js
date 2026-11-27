@@ -894,8 +894,9 @@ function buildNodesText(data, edgeHosts, cfg) {
       counters[kindKey] += 1;
       const kind = { residential: "住宅", datacenter: "机房", unknown: "未知" }[kindKey];
       const entry = edgeHosts[index % edgeHosts.length];
+      const entryEndpoint = normalizeEndpoint(entry) || entry;
       index += 1;
-      lines.push(`${entry}#${sanitizeRemark(`${name}-${kind}-${pad(counters[kindKey])}`)}$${link}`);
+      lines.push(`${entryEndpoint}#${sanitizeRemark(`${name}-${kind}-${pad(counters[kindKey])}`)}${link}`);
     }
   }
   return lines.join("\n") + (lines.length ? "\n" : "");
