@@ -1929,7 +1929,18 @@ async function getServers(ctx, force) {
 async function handleUnifiedNodesApi(request, env, ctx) {
   const u = new URL(request.url);
   const includeSstp = u.searchParams.get('sstp') !== '0';
-  const { servers, cached } = await getServers(ctx, u.searchParams.get('refresh') === '1');
+  // OpenVPN 上游故障不能阻断 SSTP：两类来源独立加载，任一来源可用即可返回统一列表。
+  let servers = [];
+  let cached = false;
+  let openvpnError = null;
+  try {
+    const upstream = await getServers(ctx, u.searchParams.get('refresh') === '1');
+    servers = upstream.servers || [];
+    cached = Boolean(upstream.cached);
+  } catch (e) {
+    openvpnError = e && e.message ? e.message : String(e);
+    console.warn('[api/nodes] OpenVPN 来源读取失败，继续返回 SSTP：', openvpnError);
+  }
   let sstpRawNodes = [];
   let sstpSource = {
     enabled: includeSstp && Boolean(env.GATE_KV),
@@ -2090,7 +2101,13 @@ async function handleUnifiedNodesApi(request, env, ctx) {
     updated_at: new Date().toISOString(),
     count: nodes.length,
     sources: {
-      openvpn: { enabled: true, available: true, cached, count: servers.length },
+      openvpn: {
+        enabled: true,
+        available: servers.length > 0,
+        cached,
+        count: servers.length,
+        ...(openvpnError ? { reason: openvpnError } : {}),
+      },
       sstp: { ...sstpSource, count: sstpNodes.length },
     },
     nodes,
