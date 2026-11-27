@@ -6,9 +6,9 @@ const HTML_PAGE = "<!DOCTYPE html>\n<html lang=\"zh-CN\">\n<head>\n<meta charset
 
 // ============================================================
 // 端点：
-//   /  /index.html   节点浏览器（表格含“纯净度”列，单节点/批量转 Mihomo）
+//   /  /index.html   节点浏览器（表格含“纯净度”列，单节点/批量转 聚合通用订阅链接：homeproxy、 v2rayN、Mihomo等）
 //   /api/servers     实时节点 JSON（边缘缓存；每节点附 quality 风险画像）
-//   /sub /mihomo /clash /subscribe   输出完整可直接订阅的 Mihomo 配置
+//   /sub /mihomo /clash /subscribe   输出完整可直接订阅的 聚合通用订阅链接 配置
 //       参数: n=1..30(默认8)  cc=国家码  proto=tcp|udp|any(默认tcp)
 //             sort=score|speed|ping|clean(默认score)  min=最低Mbps(默认3)
 //             clean=1(只留非代理/非机房且clean>=50)  maxrisk=0..100 风险上限
