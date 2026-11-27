@@ -22,7 +22,6 @@ jobs:
           node-version: 22
       - name: Check Cloudflare Worker JavaScript syntax
         run: |
-          node --check "VPN Gate-worker.js"
           node --check "_worker - 副本.js"
           node --check "worker/worker.js"
       - name: Check Python syntax
@@ -32,10 +31,10 @@ jobs:
           while IFS= read -r -d '' file; do
             bash -n "$file"
           done < <(find vps-relay -type f -name '*.sh' -print0)
-      - name: Bundle Workers with Wrangler (dry run)
+      - name: Bundle the main Worker with Wrangler (dry run)
         run: |
-          cp wrangler.sstp.toml.example .wrangler-ci-sstp.toml
-          sed -i '/^\[\[kv_namespaces\]\]/,$d' .wrangler-ci-sstp.toml
-          npx --yes wrangler@4 deploy --dry-run --config .wrangler-ci-sstp.toml
-          (cd worker && cp wrangler.toml.example .wrangler-ci.toml && npx --yes wrangler@4 deploy --dry-run --config .wrangler-ci.toml && rm -f .wrangler-ci.toml)
-          rm -f .wrangler-ci-sstp.toml
+          cd worker
+          cp wrangler.toml.example .wrangler-ci.toml
+          sed -i '/^\[\[kv_namespaces\]\]/,$d' .wrangler-ci.toml
+          npx --yes wrangler@4 deploy --dry-run --config .wrangler-ci.toml
+          rm -f .wrangler-ci.toml
