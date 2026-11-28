@@ -56,9 +56,12 @@ const SSTP_SUBSYSTEM = (() => {
  * 路径：
  *   /            仪表盘（原版 index.html 原样内嵌）
  *   /data.json   结构化数据（schema_version = 1，与原版一致）
- *   /nodes.txt   订阅文件（填入 edgetunnel「自定义优选 IP」）
+ *   /nodes.txt   原始订阅文件（保持原行为）
+ *   /nodes-clean.txt   纯净出口订阅（支持 ?maxrisk=0..100）
  *   /run         手动检测页面（浏览器里点一下，实时显示日志，自动分批跑完）
  *   /status      运行状态 JSON
+ *   /sub         聚合通用订阅（v2rayN / HomeProxy / sing-box / NekoBox / Shadowrocket 用 Base64；Clash/Mihomo 自动 YAML）
+ *                节点 = VLESS+WS+TLS 入站 → Worker 内 SSTP 拨号 VPN Gate 落地；建议设置环境变量 UUID
  *
  * 必需绑定：KV 命名空间，变量名 GATE_KV
  * 可选环境变量见下方 loadConfig()，全部与原版同名。
@@ -69,7 +72,8 @@ const SSTP_SUBSYSTEM = (() => {
 // ---------------------------------------------------------------------------
 const SCHEMA_VERSION = 1;
 
-// 检测 Worker 默认值（可用环境变量 CHECK_WORKER 或 DOMAIN 覆盖）
+// 检测 Worker（探测/转换用，另行部署）默认域名；可用变量 CHECK_WORKER 覆盖（填域名或完整地址均可）。
+// 本 Worker 自己的域名无需配置：订阅自动使用当前访问域名，需要时用变量 SUB_HOST 指定。DOMAIN 变量已不再使用。
 const DEFAULT_DOMAIN = "check.boxo.eu.org";
 
 // VPN Gate 没有 HTTPS 接口，官方 API 只提供 HTTP。
@@ -219,11 +223,11 @@ function envFloat(env, name, def, minimum = 0) {
 function normalizeWorkerBase(raw) {
   let value = (raw || "").trim();
   if (!value) {
-    throw new ConfigError("未配置检测 Worker 地址。请设置环境变量 CHECK_WORKER 或 DOMAIN（只填 host，例如 check.example.net）。");
+    throw new ConfigError("未配置检测 Worker 地址。请设置环境变量 CHECK_WORKER（例如 https://check.boxo.eu.org/check?sstp=vpn:vpn@）。");
   }
   const lowered = value.toLowerCase();
   if (PLACEHOLDER_MARKERS.some((m) => lowered.includes(m.toLowerCase()))) {
-    throw new ConfigError("检测地址仍是占位符。请把环境变量 DOMAIN 设成真实的检测 Worker host。");
+    throw new ConfigError("检测地址仍是占位符。请把环境变量 CHECK_WORKER 设成真实的检测 Worker 地址。");
   }
   if (!/^[A-Za-z][A-Za-z0-9+.-]*:\/\//.test(value)) value = "https://" + value;
   let url;
@@ -301,11 +305,11 @@ function parseEdgeHosts(raw) {
 }
 
 function loadConfig(env) {
-  let rawWorker = envStr(env, "CHECK_WORKER");
-  if (!rawWorker) {
-    const domain = envStr(env, "DOMAIN", DEFAULT_DOMAIN).replace(/^https?:\/\//i, "").replace(/\/.*$/, "");
-    rawWorker = `https://${domain}/check?sstp=vpn:vpn@`;
-  }
+  const rawWorker = envStr(
+    env,
+    "CHECK_WORKER",
+    `https://${DEFAULT_DOMAIN}/check?sstp=vpn:vpn@`
+  );
   const workerBase = normalizeWorkerBase(rawWorker);
 
   let staticRaw = envStr(env, "HOSTS_ENTRY");
@@ -633,20 +637,14 @@ function prioritize(nodes) {
 // ---------------------------------------------------------------------------
 // 分类（以 Worker 的出口信息为准，缺失时才看 Operator 关键字）
 // ---------------------------------------------------------------------------
-function classifyNetwork(org, isDatacenter, exitInfo = {}) {
+function classifyNetwork(org, isDatacenter) {
   if (isDatacenter === true) return "datacenter";
-  // 代理/VPN/Tor 不进入住宅池；abuser/bogon/crawler 是风险信号，单独计分，不抹掉真实 ISP/住宅 ASN 分类。
-  if (
-    exitInfo.is_proxy === true ||
-    exitInfo.is_vpn === true ||
-    exitInfo.is_tor === true
-  ) return "unknown";
+  if (isDatacenter === false) return "residential";
   const upper = (org || "").toUpperCase();
   if (upper) {
     if (DATA_CENTER_ORG_KEYWORDS.some((k) => upper.includes(k))) return "datacenter";
     if (RESIDENTIAL_ORG_KEYWORDS.some((k) => upper.includes(k))) return "residential";
   }
-  // is_datacenter=false 只表示未标记为机房，不足以证明是住宅/运营商网络。
   return "unknown";
 }
 
@@ -716,16 +714,8 @@ async function checkOne(node, cfg, budget, service) {
         asn: get(asn.asn),
         org,
         is_datacenter: get(exitInfo.is_datacenter),
-        is_proxy: get(exitInfo.is_proxy ?? exitInfo.privacy?.is_proxy),
-        is_vpn: get(exitInfo.is_vpn ?? exitInfo.privacy?.is_vpn),
-        is_tor: get(exitInfo.is_tor ?? exitInfo.privacy?.is_tor),
-        is_abuser: get(exitInfo.is_abuser ?? exitInfo.privacy?.is_abuser),
-        is_bogon: get(exitInfo.is_bogon ?? exitInfo.privacy?.is_bogon),
-        is_crawler: get(exitInfo.is_crawler),
-        is_mobile: get(exitInfo.is_mobile ?? exitInfo.privacy?.is_mobile),
-        is_satellite: get(exitInfo.is_satellite ?? exitInfo.privacy?.is_satellite),
       };
-      result.residential = classifyNetwork(org, exitInfo.is_datacenter, result.exit);
+      result.residential = classifyNetwork(org, exitInfo.is_datacenter);
     } else if (success) {
       result.residential = "unknown";
     }
@@ -814,6 +804,159 @@ async function getCombinedEdgeHosts(cfg, budget, log) {
 }
 
 // ---------------------------------------------------------------------------
+// 出口 IP 纯净度画像（移植自 worker/worker.js；画像目标为检测结果 exit.ip）
+// ---------------------------------------------------------------------------
+const QUALITY_TTL_SECONDS = 21600;
+const QUALITY_BATCH_SIZE = 100;
+const QUALITY_MAX_BATCHES = 15;
+const HOSTING_KEYWORDS = /\b(vps|hosting|hosted|datacenter|data center|cloud|cloud compute|server|colo|colocation|dedicated|digital ocean|amazon|aws|google cloud|azure|ovh|hetzner|vultr|linode|leaseweb|contabo|choopa|m247|online sas|oracle cloud|腾讯云|阿里云|华为云|机房|云计算|服务器)\b/i;
+
+function assessGateQuality(r) {
+  if (!r) return null;
+  const proxy = r.proxy === true, hosting = r.hosting === true, mobile = r.mobile === true;
+  const kind = String(r.type || "").toLowerCase();
+  const orgText = [r.isp, r.org, r.as, r.asname, r.type].filter(Boolean).join(" ");
+  let risk = 0;
+  if (proxy) risk += 45;
+  if (hosting) risk += 25;
+  if (kind === "business") risk += 6;
+  if (HOSTING_KEYWORDS.test(orgText)) risk += 15;
+  if (mobile) risk = Math.max(0, risk - 20);
+  if (kind === "isp" && !proxy && !hosting) risk = Math.min(risk, 10);
+  risk = Math.max(0, Math.min(100, risk));
+  const clean = 100 - risk;
+  return { proxy, hosting, mobile, kind: kind || "unknown", isp: r.isp || r.org || r.as || "",
+    risk, clean, grade: clean < 50 ? "risk" : clean < 80 ? "mid" : "clean",
+    country_code: r.countryCode || null, source: "ip-api.com", checked_at: Date.now() };
+}
+
+async function enrichGateExitQuality(results, store, budget, log) {
+  const targets = new Map();
+  for (const node of results) {
+    const ip = node && node.success && node.exit && node.exit.ip ? String(node.exit.ip).trim() : "";
+    if (!ip) continue;
+    if (!targets.has(ip)) targets.set(ip, []);
+    targets.get(ip).push(node);
+  }
+  if (!targets.size) {
+    log("IP QUALITY", "没有有效出口 IP，跳过纯净度画像");
+    return { checked: 0, cached: 0, failed: 0 };
+  }
+  const qualityByIp = new Map();
+  let cached = 0, failed = 0;
+  const ips = [...targets.keys()];
+  for (const ip of ips) {
+    try {
+      const saved = await store.get("quality:" + encodeURIComponent(ip), "json");
+      if (saved && typeof saved.risk === "number" && Date.now() - (saved.checked_at || 0) < QUALITY_TTL_SECONDS * 1000) {
+        qualityByIp.set(ip, saved); cached++;
+      }
+    } catch (e) { /* KV 读取失败时走实时画像 */ }
+  }
+  const uncached = ips.filter((ip) => !qualityByIp.has(ip));
+  const limited = uncached.slice(0, QUALITY_BATCH_SIZE * QUALITY_MAX_BATCHES);
+  if (uncached.length > limited.length) {
+    log("IP QUALITY", `出口 IP ${ips.length} 个；本轮画像上限 ${limited.length} 个，其他节点保留原始结果`);
+  }
+  for (let i = 0; i < limited.length; i += QUALITY_BATCH_SIZE) {
+    const chunk = limited.slice(i, i + QUALITY_BATCH_SIZE);
+    if (!budget.take()) {
+      log("IP QUALITY", "子请求额度不足，剩余 IP 跳过画像；原始订阅照常发布");
+      failed += limited.length - i; break;
+    }
+    try {
+      const response = await fetch("http://ip-api.com/batch?fields=status,message,query,countryCode,isp,org,as,asname,type,mobile,proxy,hosting", {
+        method: "POST",
+        headers: { "content-type": "application/json", "User-Agent": "VPNGateSub/3.0" },
+        body: JSON.stringify(chunk.map((ip) => ({ query: ip }))),
+        signal: AbortSignal.timeout(10000)
+      });
+      if (!response.ok) throw new Error("HTTP " + response.status);
+      const rows = await response.json();
+      if (!Array.isArray(rows)) throw new Error("响应格式不是数组");
+      const returned = new Set();
+      for (const row of rows) {
+        if (!row || row.status !== "success" || !row.query) continue;
+        const ip = String(row.query).trim();
+        if (!targets.has(ip)) continue;
+        const quality = assessGateQuality(row);
+        qualityByIp.set(ip, quality); returned.add(ip);
+        try {
+          await store.put("quality:" + encodeURIComponent(ip), JSON.stringify(quality), { expirationTtl: QUALITY_TTL_SECONDS });
+        } catch (e) { /* 缓存写入失败不影响本轮 */ }
+      }
+      for (const ip of chunk) if (!returned.has(ip)) failed++;
+    } catch (e) {
+      failed += chunk.length;
+      log("IP QUALITY", `画像批次失败，降级继续：${e && e.message ? e.message : e}`);
+    }
+  }
+  for (const [ip, nodes] of targets) {
+    const quality = qualityByIp.get(ip) || null;
+    for (const node of nodes) node.quality = quality;
+  }
+  log("IP QUALITY", `出口 IP ${ips.length} 个，画像成功 ${qualityByIp.size} 个（缓存 ${cached}），未画像 ${Math.max(0, ips.length - qualityByIp.size)} 个`);
+  return { checked: qualityByIp.size, cached, failed };
+}
+
+function isCleanGateNode(node, maxRisk = 50) {
+  const q = node && node.quality;
+  if (!node || !node.success || !q || q.proxy === true || q.hosting === true) return false;
+  if (Number(q.risk) > maxRisk || Number(q.clean) < 50) return false;
+  return node.residential === "residential" || q.kind === "isp" || q.mobile === true;
+}
+
+// 纯净度：quality.clean(0-100)；已知代理 / 托管机房 / 机房出口视为「标红」
+function purityOf(node) {
+  const q = node && node.quality;
+  return q && Number.isFinite(Number(q.clean)) ? Math.max(0, Math.min(100, Math.round(Number(q.clean)))) : null;
+}
+function isFlaggedNode(node) {
+  const q = node && node.quality;
+  return !!node && (node.residential === "datacenter" || (q && (q.proxy === true || q.hosting === true)));
+}
+// 排序：干净住宅/运营商 → 未标红 → 标红；同档按纯净度降序 → 住宅优先 → 延迟升序
+function puritySortKey(node) {
+  const p = purityOf(node);
+  const tier = isCleanGateNode(node, 50) ? 0 : (isFlaggedNode(node) ? 2 : 1);
+  return [tier, -(p === null ? -1 : p), node.residential === "residential" ? 0 : 1, node.latency_ms == null ? 1 : 0, Number(node.latency_ms) || 0];
+}
+function purityBadge(node) {
+  if (isFlaggedNode(node)) return "🔴";
+  const p = purityOf(node);
+  if (p === null) return "⚪";
+  if (p >= 80) return "🟢";
+  if (p >= 50) return "🟡";
+  return "🔴";
+}
+
+function buildCleanNodesText(data, edgeHosts, cfg, maxRisk = 50) {
+  const filtered = { ...data, countries: {} };
+  for (const [code, group] of Object.entries(data.countries || {})) {
+    const nodes = (group.nodes || []).filter((node) => isCleanGateNode(node, maxRisk));
+    if (!nodes.length) continue;
+    filtered.countries[code] = { ...group, nodes, count: nodes.length,
+      residential: nodes.filter((n) => n.residential === "residential").length,
+      datacenter: nodes.filter((n) => n.residential === "datacenter").length,
+      unknown: nodes.filter((n) => n.residential !== "residential" && n.residential !== "datacenter").length };
+  }
+  return buildNodesText(filtered, edgeHosts, cfg);
+}
+
+// /sub 输出完整可导入配置；clean=1 时仅保留已验证的低风险住宅/运营商出口。
+function buildSubscriptionText(data, edgeHosts, cfg, cleanOnly = false) {
+  if (cleanOnly) {
+    const filtered = { ...data, countries: {} };
+    for (const [code, group] of Object.entries(data.countries || {})) {
+      const nodes = (group.nodes || []).filter((node) => isCleanGateNode(node, 50));
+      if (nodes.length) filtered.countries[code] = { ...group, nodes, count: nodes.length };
+    }
+    return buildNodesText(filtered, edgeHosts, cfg, { annotateQuality: true, includeAll: true, sortQuality: true, globalPurity: true });
+  }
+  return buildNodesText(data, edgeHosts, cfg, { annotateQuality: true, includeAll: true, sortQuality: true, globalPurity: true });
+}
+
+// ---------------------------------------------------------------------------
 // 产物
 // ---------------------------------------------------------------------------
 function sanitizeRemark(text) {
@@ -856,6 +999,9 @@ function buildOutputs({ results, rawCount, sstpCount, source, workerHost, durati
     residential_est: available.filter((n) => n.residential === "residential").length,
     datacenter_est: available.filter((n) => n.residential === "datacenter").length,
     unknown_est: available.filter((n) => n.residential === "unknown").length,
+    quality_checked: available.filter((n) => n.quality && typeof n.quality.risk === "number").length,
+    clean_eligible: available.filter((n) => isCleanGateNode(n, 50)).length,
+    high_risk: available.filter((n) => n.quality && n.quality.risk > 50).length,
   };
   return {
     schema_version: SCHEMA_VERSION,
@@ -868,7 +1014,7 @@ function buildOutputs({ results, rawCount, sstpCount, source, workerHost, durati
   };
 }
 
-function buildNodesText(data, edgeHosts, cfg) {
+function buildNodesText(data, edgeHosts, cfg, options = {}) {
   if (!edgeHosts.length) throw new ConfigError("优选入口池为空，无法生成 nodes.txt");
   const lines = [];
   const seenLinks = new Set();
@@ -876,25 +1022,40 @@ function buildNodesText(data, edgeHosts, cfg) {
   const ordered = Object.entries(data.countries).sort((a, b) =>
     compareTuples([-(Number(a[1].count) || 0), String(a[1].code || a[0])], [-(Number(b[1].count) || 0), String(b[1].code || b[0])])
   );
+  // 先按国家挑选节点（保留每国上限逻辑），再决定输出顺序
+  const picked = [];
   for (const [code, group] of ordered) {
-    const name = COUNTRY_ZH[code] || group.name || code;
-    const nodes = [...group.nodes].sort((a, b) => compareTuples(nodeSortKey(a), nodeSortKey(b)));
-    // nodes.txt 只发布已识别为住宅/运营商网络的节点；机房与未知节点仍保留在 data.json 供浏览器查看。
+    const nodes = [...group.nodes].sort((a, b) =>
+      options.sortQuality ? compareTuples(puritySortKey(a), puritySortKey(b)) : compareTuples(nodeSortKey(a), nodeSortKey(b))
+    );
     const residential = nodes.filter((n) => n.residential === "residential");
-    const chosen = residential.slice(0, cfg.maxResidentialPerCountry);
-    const counters = { residential: 0, datacenter: 0, unknown: 0 };
-    for (const node of chosen) {
-      const link = `sstp://vpn:vpn@${node.host}:${node.port}`;
-      if (seenLinks.has(link)) continue;
-      seenLinks.add(link);
-      const kindKey = Object.prototype.hasOwnProperty.call(counters, node.residential) ? node.residential : "unknown";
-      counters[kindKey] += 1;
-      const kind = { residential: "住宅", datacenter: "机房", unknown: "未知" }[kindKey];
-      const entry = edgeHosts[index % edgeHosts.length];
-      const entryEndpoint = normalizeEndpoint(entry) || entry;
-      index += 1;
-      lines.push(`${entryEndpoint}#${sanitizeRemark(`${name}-${kind}-${pad(counters[kindKey])}`)}$${link}`);
-    }
+    const others = nodes.filter((n) => n.residential !== "residential");
+    const chosen = options.includeAll ? nodes : [
+      ...residential.slice(0, cfg.maxResidentialPerCountry),
+      ...others.slice(0, cfg.maxDatacenterPerCountry),
+    ];
+    for (const node of chosen) picked.push({ code, group, node });
+  }
+  // globalPurity：跨国家全局按纯净度排序，干净住宅/运营商(绿色 100)排最前
+  if (options.globalPurity) picked.sort((a, b) => compareTuples(puritySortKey(a.node), puritySortKey(b.node)));
+  const counters = {};
+  for (const { code, group, node } of picked) {    const link = `sstp://vpn:vpn@${node.host}:${node.port}`;
+    if (seenLinks.has(link)) continue;
+    seenLinks.add(link);
+    const name = COUNTRY_ZH[code] || group.name || code;
+    const kindKey = ["residential", "datacenter"].includes(node.residential) ? node.residential : "unknown";
+    const ck = code + "|" + kindKey;
+    counters[ck] = (counters[ck] || 0) + 1;
+    const kind = { residential: "住宅", datacenter: "机房", unknown: "未知" }[kindKey];
+    const entry = edgeHosts[index % edgeHosts.length];
+    index += 1;
+    const q = purityOf(node);
+    const purity = q === null ? "P?" : `P${pad(q, 3)}`;
+    const flag = node.quality && node.quality.proxy === true ? "-代理" : (node.quality && node.quality.hosting === true ? "-托管" : "");
+    const remark = options.annotateQuality
+      ? `${purityBadge(node)}${name}-${kind}-${pad(counters[ck])}-${purity}${flag}`
+      : `${name}-${kind}-${pad(counters[ck])}`;
+    lines.push(`${entry}#${sanitizeRemark(remark)}$${link}`);
   }
   return lines.join("\n") + (lines.length ? "\n" : "");
 }
@@ -1071,7 +1232,8 @@ async function runStepInner({ env, store, cfg, log, lines, meta, trigger, emit }
 
   if (pending.length) {
     const batch = cfg.batchSize > 0 ? pending.slice(0, cfg.batchSize) : pending;
-    budget.reserve = batch.length === pending.length ? cfg.optimalUrls.length : 0;
+    const qualityReserve = batch.length === pending.length ? Math.min(QUALITY_MAX_BATCHES, Math.ceil(state.nodes.length / QUALITY_BATCH_SIZE), Math.max(0, cfg.subrequestLimit - cfg.optimalUrls.length - 1)) : 0;
+    budget.reserve = batch.length === pending.length ? cfg.optimalUrls.length + qualityReserve : 0;
     log("CLOUDFLARE WORKER", `本轮检测 ${batch.length}/${pending.length} 个节点`);
     const stopAt = Math.min(Date.now() + cfg.stepSeconds * 1000, state.checkStartedAt + cfg.deadlineS * 1000);
     // 心跳：检测期间每 5 秒向页面发一行进度，避免连接因长时间无数据被切断
@@ -1140,35 +1302,34 @@ async function runStepInner({ env, store, cfg, log, lines, meta, trigger, emit }
     );
   }
 
+  const edgeHosts = await getCombinedEdgeHosts(cfg, budget, log);
+  // 只用检测 Worker 返回的真实出口 IP exit.ip 画像，不使用 VPN Gate 入口 IP。
+  await enrichGateExitQuality(results, store, budget, log);
+
   const workerHost = (() => {
-    try {
-      return new URL(cfg.workerBase).host || "unknown";
-    } catch (e) {
-      return "unknown";
-    }
+    try { return new URL(cfg.workerBase).host || "unknown"; }
+    catch (e) { return "unknown"; }
   })();
   const data = buildOutputs({
-    results,
-    rawCount: state.rawCount,
-    sstpCount: state.sstpCount,
-    source: state.source,
-    workerHost,
-    durationS: (Date.now() - state.startedAt) / 1000,
-    timedOut: state.timedOut,
+    results, rawCount: state.rawCount, sstpCount: state.sstpCount, source: state.source,
+    workerHost, durationS: (Date.now() - state.startedAt) / 1000, timedOut: state.timedOut,
   });
-
-  const edgeHosts = await getCombinedEdgeHosts(cfg, budget, log);
   const nodesText = buildNodesText(data, edgeHosts, cfg);
+  const cleanNodesText = buildCleanNodesText(data, edgeHosts, cfg, 50);
   const nodesCount = nodesText.split("\n").filter((l) => l.trim()).length;
+  const cleanNodesCount = cleanNodesText.split("\n").filter((l) => l.trim()).length;
 
   await store.put("data.json", JSON.stringify(data));
   await store.put("nodes.txt", nodesText);
+  await store.put("nodes-clean.txt", cleanNodesText);
+  await store.put("edge-hosts.json", JSON.stringify(edgeHosts));
 
   const nodesUrl = cfg.nodesUrl || (meta.origin ? `${meta.origin}/nodes.txt` : "https://<你的Worker域名>/nodes.txt");
   log("RESULT", `可用节点 ${data.stats.success}, 国家/地区 ${data.stats.countries}, nodes.txt ${nodesCount} 行`);
   log("WEBSITE", "生成 data.json");
   log("WEBSITE", "生成 index.html");
   log("WEBSITE", "生成 nodes.txt");
+  log("WEBSITE", `生成 nodes-clean.txt（默认 maxrisk=50，${cleanNodesCount} 行）`);
   log("USAGE", `把 ${nodesUrl} 填入 edgetunnel 后台「自定义优选 IP」`);
   log("WEBSITE", "完成（已发布到本 Worker）");
 
@@ -1176,7 +1337,7 @@ async function runStepInner({ env, store, cfg, log, lines, meta, trigger, emit }
   meta.lastFinishedAt = Date.now();
   meta.lastStatus = "published";
   meta.lastMessage = `可用 ${data.stats.success} / 已检测 ${data.stats.checked}`;
-  meta.summary = buildSummary(data, nodesCount, nodesUrl);
+  meta.summary = buildSummary(data, nodesCount, nodesUrl) + `\n\n纯净订阅：${meta.origin ? meta.origin + "/nodes-clean.txt" : "/nodes-clean.txt"}（${cleanNodesCount} 行；可用 ?maxrisk=30 调整风险阈值）`;
   meta.lastLogs = state.logs.concat(lines).slice(-400);
   await store.put("meta", JSON.stringify(meta));
   return { done: true, status: "published", message: meta.lastMessage };
@@ -1211,154 +1372,187 @@ const INDEX_HTML = String.raw`<!DOCTYPE html>
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>VPN Gate SSTP 节点检测 · 住宅/机房</title>
   <style>
+    :root {
+      --bg: #f6f8fa; --card: #ffffff; --line: #d0d7de; --line2: #eaeef2; --text: #1f2328; --muted: #656d76;
+      --code: #eef1f4; --hover: #f3f4f6; --accent: #0969da; --accent-text: #ffffff;
+      --g-fg: #1a7f37; --g-bg: #dafbe1; --g-bd: #9ad8a8;
+      --y-fg: #9a6700; --y-bg: #fff8c5; --y-bd: #e3c76a;
+      --r-fg: #cf222e; --r-bg: #ffebe9; --r-bd: #f2a7a7;
+      --n-fg: #656d76; --n-bg: #f6f8fa; --n-bd: #d0d7de;
+      --gap: clamp(8px, 1.6vw, 14px); --pad: clamp(12px, 3vw, 28px); --row: clamp(8px, 1.2vw, 12px);
+      color-scheme: light;
+    }
+    :root[data-theme="dark"] {
+      --bg: #0d1117; --card: #161b22; --line: #30363d; --line2: #21262d; --text: #e6edf3; --muted: #8d96a0;
+      --code: #1f2630; --hover: #1f2630; --accent: #2f81f7; --accent-text: #ffffff;
+      --g-fg: #3fb950; --g-bg: rgba(46,160,67,.15); --g-bd: rgba(46,160,67,.45);
+      --y-fg: #d29922; --y-bg: rgba(187,128,9,.15); --y-bd: rgba(187,128,9,.45);
+      --r-fg: #f85149; --r-bg: rgba(248,81,73,.13); --r-bd: rgba(248,81,73,.45);
+      --n-fg: #8d96a0; --n-bg: #1f2630; --n-bd: #30363d;
+      color-scheme: dark;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root:not([data-theme="light"]):not([data-theme="dark"]) {
+        --bg: #0d1117; --card: #161b22; --line: #30363d; --line2: #21262d; --text: #e6edf3; --muted: #8d96a0;
+        --code: #1f2630; --hover: #1f2630; --accent: #2f81f7; --accent-text: #ffffff;
+        --g-fg: #3fb950; --g-bg: rgba(46,160,67,.15); --g-bd: rgba(46,160,67,.45);
+        --y-fg: #d29922; --y-bg: rgba(187,128,9,.15); --y-bd: rgba(187,128,9,.45);
+        --r-fg: #f85149; --r-bg: rgba(248,81,73,.13); --r-bd: rgba(248,81,73,.45);
+        --n-fg: #8d96a0; --n-bg: #1f2630; --n-bd: #30363d;
+        color-scheme: dark;
+      }
+    }
     * { box-sizing: border-box; }
     body {
       margin: 0;
-      padding: 24px;
+      padding: var(--pad);
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
-      color: #1f2328;
-      background: #f6f8fa;
+      color: var(--text);
+      background: var(--bg);
       line-height: 1.6;
+      transition: background .2s, color .2s;
     }
-    .wrap { max-width: 1120px; margin: 0 auto; }
-    header { margin-bottom: 20px; }
-    h1 { font-size: 22px; margin: 0 0 6px; }
-    .sub { color: #656d76; font-size: 13px; }
-    .stats {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
-      gap: 10px;
-      margin: 18px 0;
-    }
-    .stat {
-      background: #fff;
-      border: 1px solid #d0d7de;
-      border-radius: 10px;
-      padding: 12px 14px;
-    }
-    .stat .k { font-size: 12px; color: #656d76; }
-    .stat .v { font-size: 22px; font-weight: 600; margin-top: 2px; }
-    .toolbar {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 8px;
-      align-items: center;
-      margin: 16px 0;
-    }
+    .wrap { max-width: 1180px; margin: 0 auto; }
+    header { display: flex; flex-wrap: wrap; gap: var(--gap); align-items: flex-start; justify-content: space-between; margin-bottom: var(--gap); }
+    header .title { flex: 1 1 320px; min-width: 0; }
+    h1 { font-size: clamp(18px, 2.4vw, 22px); margin: 0 0 6px; }
+    .sub { color: var(--muted); font-size: 13px; }
+    .theme { display: inline-flex; border: 1px solid var(--line); border-radius: 999px; overflow: hidden; background: var(--card); flex: 0 0 auto; }
+    .theme button { border: 0; border-radius: 0; padding: 6px 12px; }
+    .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: var(--gap); margin: var(--gap) 0; }
+    .stat { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: var(--row) 14px; }
+    .stat .k { font-size: 12px; color: var(--muted); }
+    .stat .v { font-size: clamp(18px, 2.2vw, 22px); font-weight: 600; margin-top: 2px; }
+    .stat.g .v { color: var(--g-fg); }
+    .stat.r .v { color: var(--r-fg); }
+    .toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: var(--gap) 0; }
+    .toolbar .sep { width: 1px; align-self: stretch; background: var(--line); margin: 0 2px; }
     .toolbar input {
-      flex: 1 1 220px;
-      min-width: 180px;
-      padding: 8px 10px;
-      border: 1px solid #d0d7de;
-      border-radius: 8px;
-      font-size: 14px;
-      background: #fff;
+      flex: 1 1 220px; min-width: 160px; padding: 8px 10px; border: 1px solid var(--line);
+      border-radius: 8px; font-size: 14px; background: var(--card); color: var(--text);
     }
     button, .btn {
-      padding: 7px 12px;
-      border: 1px solid #d0d7de;
-      border-radius: 8px;
-      background: #fff;
-      font-size: 13px;
-      cursor: pointer;
-      color: #1f2328;
-      text-decoration: none;
+      padding: 7px 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--card);
+      font-size: 13px; cursor: pointer; color: var(--text); text-decoration: none; line-height: 1.4;
     }
-    button:hover, .btn:hover { background: #f3f4f6; }
-    button.active { background: #0969da; border-color: #0969da; color: #fff; }
-    .country {
-      background: #fff;
-      border: 1px solid #d0d7de;
-      border-radius: 10px;
-      margin-bottom: 12px;
-      overflow: hidden;
-    }
-    .country-head {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 8px;
-      align-items: center;
-      padding: 12px 14px;
-      border-bottom: 1px solid #eaeef2;
-    }
+    button:hover, .btn:hover { background: var(--hover); }
+    button.active { background: var(--accent); border-color: var(--accent); color: var(--accent-text); }
+    .subbox { background: var(--card); border: 1px solid var(--line); border-left: 4px solid var(--accent); border-radius: 10px; padding: var(--row) 14px; margin: var(--gap) 0; display: grid; gap: 8px; }
+    .subbox .subrow { display: grid; grid-template-columns: 150px minmax(0, 1fr) auto; gap: 10px; align-items: center; }
+    .subbox .subname { font-weight: 600; font-size: 13px; line-height: 1.3; }
+    .subbox .subname small { display: block; font-weight: 400; font-size: 11px; color: var(--muted); }
+    .subbox code { background: var(--code); padding: 5px 8px; border-radius: 6px; font-size: 12px; overflow-wrap: anywhere; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    .subbox button { white-space: nowrap; }
+    .subbox .tip { font-size: 12px; color: var(--muted); }
+    @media (max-width: 560px) { .subbox .subrow { grid-template-columns: 1fr auto; } .subbox .subname { grid-column: 1 / 3; } }
+    .legend { display: flex; flex-wrap: wrap; gap: 8px; font-size: 12px; color: var(--muted); margin: 0 0 var(--gap); align-items: center; }
+    .country { background: var(--card); border: 1px solid var(--line); border-radius: 10px; margin-bottom: var(--gap); overflow: hidden; }
+    .country-head { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; padding: var(--row) 14px; border-bottom: 1px solid var(--line2); }
     .country-head strong { font-size: 15px; }
-    .pill {
-      font-size: 11px;
-      padding: 1px 8px;
-      border-radius: 999px;
-      border: 1px solid #d0d7de;
-      color: #656d76;
-      background: #f6f8fa;
-    }
-    .pill.res { color: #1a7f37; border-color: #b7e4c7; background: #eefbf1; }
-    .pill.dc { color: #9a6700; border-color: #f0d69a; background: #fff8e5; }
+    .pill { font-size: 11px; padding: 1px 8px; border-radius: 999px; border: 1px solid var(--n-bd); color: var(--n-fg); background: var(--n-bg); white-space: nowrap; }
+    .pill.g { color: var(--g-fg); border-color: var(--g-bd); background: var(--g-bg); }
+    .pill.y { color: var(--y-fg); border-color: var(--y-bd); background: var(--y-bg); }
+    .pill.r { color: var(--r-fg); border-color: var(--r-bd); background: var(--r-bg); }
+    .score { font-weight: 700; font-size: 12px; min-width: 58px; text-align: center; font-variant-numeric: tabular-nums; }
     .node {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 10px;
-      align-items: center;
-      padding: 9px 14px;
-      border-top: 1px solid #f0f2f4;
-      font-size: 13px;
+      display: grid;
+      grid-template-columns: 26px 66px minmax(170px, 1.4fr) auto 70px minmax(0, 1fr) auto;
+      gap: var(--row) 10px; align-items: center; padding: var(--row) 14px;
+      border-top: 1px solid var(--line2); border-left: 3px solid transparent; font-size: 13px;
     }
     .node:first-child { border-top: none; }
-    .host { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
-    .muted { color: #656d76; }
-    .grow { flex: 1 1 auto; }
-    .empty { color: #656d76; text-align: center; padding: 40px 0; }
-    footer { margin-top: 24px; color: #656d76; font-size: 12px; }
-    footer code { background: #eef1f4; padding: 1px 6px; border-radius: 6px; }
+    .node.flag { border-left-color: var(--r-fg); background: var(--r-bg); }
+    .node.clean { border-left-color: var(--g-fg); }
+    .rank { color: var(--muted); font-size: 12px; text-align: right; font-variant-numeric: tabular-nums; }
+    .host { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; overflow-wrap: anywhere; }
+    .tags { display: flex; flex-wrap: wrap; gap: 4px; }
+    .muted { color: var(--muted); }
+    .org { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .empty { color: var(--muted); text-align: center; padding: 40px 0; }
+    footer { margin-top: calc(var(--gap) * 2); color: var(--muted); font-size: 12px; display: grid; gap: 6px; }
+    footer code { background: var(--code); padding: 1px 6px; border-radius: 6px; overflow-wrap: anywhere; }
+    footer button { padding: 2px 10px; font-size: 12px; }
     .toast {
-      position: fixed;
-      left: 50%;
-      bottom: 24px;
-      transform: translateX(-50%);
-      background: #1f2328;
-      color: #fff;
-      padding: 8px 16px;
-      border-radius: 999px;
-      font-size: 13px;
-      opacity: 0;
-      transition: opacity .2s;
-      pointer-events: none;
+      position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%); background: var(--text); color: var(--bg);
+      padding: 8px 16px; border-radius: 999px; font-size: 13px; opacity: 0; transition: opacity .2s; pointer-events: none;
     }
     .toast.show { opacity: 1; }
-    @media (max-width: 520px) {
-      body { padding: 14px; }
-      .node { padding: 8px 12px; }
+    @media (max-width: 760px) {
+      .node { grid-template-columns: 26px 62px 1fr auto; }
+      .node .lat { grid-column: 3; }
+      .node .org { grid-column: 2 / 4; white-space: normal; }
+      .node .tags { grid-column: 3 / 5; }
+      .node .copy { grid-column: 4; grid-row: 1; }
+    }
+    @media (max-width: 420px) {
+      .node { grid-template-columns: 22px auto 1fr auto; gap: 4px 8px; }
+      .node .score { grid-column: 2; grid-row: 1; justify-self: start; }
+      .node .host { grid-column: 3 / 4; grid-row: 1; }
+      .node .copy { grid-column: 4; grid-row: 1; }
+      .node .tags { grid-column: 2 / 5; }
+      .node .lat { grid-column: 2; }
+      .node .org { grid-column: 3 / 5; white-space: nowrap; }
     }
   </style>
+  <script>
+    (function () { try { var t = localStorage.getItem('vg-theme'); if (t === 'light' || t === 'dark') document.documentElement.setAttribute('data-theme', t); } catch (e) {} })();
+  </script>
 </head>
 <body>
   <div class="wrap">
     <header>
-      <h1>VPN Gate SSTP 节点检测</h1>
-      <div class="sub">
-        数据来自 VPN Gate（TCP/SSTP 端口），由 Cloudflare Worker 实测出口。
-        <span id="meta">加载中…</span>
+      <div class="title">
+        <h1>VPN Gate SSTP 节点检测</h1>
+        <div class="sub">
+          数据来自 VPN Gate（TCP/SSTP 端口），由 Cloudflare Worker 实测出口，按纯净度排序。
+          <span id="meta">加载中…</span>
+        </div>
+      </div>
+      <div class="theme" id="theme">
+        <button data-theme="light">☀️ 白天</button>
+        <button data-theme="dark">🌙 夜间</button>
+        <button data-theme="auto">🖥 自动</button>
       </div>
     </header>
+
+    <div class="subbox">
+      <div class="subrow"><span class="subname">通用订阅<small>v2rayN / HomeProxy / sing-box / Clash 自动识别</small></span><code id="sub-all">…</code><button data-copy="sub-all">复制</button></div>
+      <div class="subrow"><span class="subname">🟢 纯净订阅<small>只含干净住宅 / 运营商出口</small></span><code id="sub-clean">…</code><button data-copy="sub-clean">复制</button></div>
+      <div class="subrow"><span class="subname">Clash / Mihomo<small>强制 YAML 格式</small></span><code id="sub-clash">…</code><button data-copy="sub-clash">复制</button></div>
+      <div class="subrow"><span class="subname">edgetunnel 优选源<small>nodes.txt 原格式（非客户端订阅）</small></span><code id="sub-nodes">…</code><button data-copy="sub-nodes">复制</button></div>
+      <div class="tip">把「通用订阅」整条地址粘贴到 v2rayN「订阅分组 → 添加」或 HomeProxy「订阅 → 订阅地址」，然后更新订阅即可；无需放进其他面板的优选列表。</div>
+    </div>
 
     <div class="stats" id="stats"></div>
 
     <div class="toolbar">
       <input id="search" type="search" placeholder="搜索主机 / 国家 / 运营商，例如 japan、ntt" />
+      <button data-view="rank" class="active">纯净度排行</button>
+      <button data-view="country">按国家</button>
+      <span class="sep"></span>
       <button data-filter="all" class="active">全部</button>
+      <button data-filter="clean">🟢 纯净</button>
       <button data-filter="residential">住宅</button>
       <button data-filter="datacenter">机房</button>
+      <button data-filter="flag">🔴 代理/机房</button>
       <button data-filter="unknown">未识别</button>
+    </div>
+    <div class="toolbar">
       <button id="copy-all">复制全部链接</button>
       <a class="btn" href="nodes.txt" download="nodes.txt">下载 nodes.txt</a>
+      <a class="btn" href="nodes-clean.txt" download="nodes-clean.txt">下载纯净订阅</a>
       <button id="refresh">刷新</button>
       <a class="btn" href="run">手动检测 /run</a>
       <a class="btn" href="status" target="_blank">运行状态 /status</a>
+    </div>
+    <div class="legend">
+      纯净度：<span class="pill g">🟢 80–100 干净</span><span class="pill y">🟡 50–79 一般</span><span class="pill r">🔴 &lt;50 / 已知代理 / 机房</span><span class="pill">⚪ 未画像</span>
     </div>
 
     <div id="list"><div class="empty">加载中…</div></div>
 
     <footer>
-      <div>订阅地址：<code id="sub-url">…</code></div>
-      <div id="foot">本页面每 5 分钟自动检查一次更新；数据仅供参考，节点可用性与出口属性可能随时变化。</div>
+      <div id="foot">本页面自动检查更新；数据仅供参考，节点可用性与出口属性可能随时变化。</div>
     </footer>
   </div>
   <div class="toast" id="toast"></div>
@@ -1367,7 +1561,7 @@ const INDEX_HTML = String.raw`<!DOCTYPE html>
     (function () {
       'use strict';
 
-      var state = { data: null, filter: 'all', keyword: '', timer: null };
+      var state = { data: null, filter: 'all', view: 'rank', keyword: '', timer: null, lastLoad: 0 };
 
       function esc(value) {
         return String(value == null ? '' : value)
@@ -1407,36 +1601,135 @@ const INDEX_HTML = String.raw`<!DOCTYPE html>
         document.body.removeChild(area);
       }
 
-      function statCard(label, value) {
-        return '<div class="stat"><div class="k">' + esc(label) + '</div><div class="v">' + esc(value) + '</div></div>';
+      // ---------- 主题：白天 / 夜间 / 跟随系统 ----------
+      function applyTheme(t) {
+        if (t === 'light' || t === 'dark') document.documentElement.setAttribute('data-theme', t);
+        else document.documentElement.removeAttribute('data-theme');
+        try { if (t === 'auto') localStorage.removeItem('vg-theme'); else localStorage.setItem('vg-theme', t); } catch (e) {}
+        document.querySelectorAll('#theme button').forEach(function (b) {
+          b.classList.toggle('active', b.getAttribute('data-theme') === t);
+        });
+      }
+      var savedTheme = 'auto';
+      try { savedTheme = localStorage.getItem('vg-theme') || 'auto'; } catch (e) {}
+      applyTheme(savedTheme);
+      document.querySelectorAll('#theme button').forEach(function (b) {
+        b.addEventListener('click', function () { applyTheme(b.getAttribute('data-theme')); });
+      });
+
+      // ---------- 订阅地址（立即显示，不依赖数据加载） ----------
+      (function () {
+        var baseUrl = location.origin + location.pathname.replace(/[^/]*$/, '');
+        var map = { 'sub-all': 'sub', 'sub-clean': 'sub?clean=1', 'sub-clash': 'sub?format=clash', 'sub-nodes': 'nodes.txt' };
+        Object.keys(map).forEach(function (id) { document.getElementById(id).textContent = baseUrl + map[id]; });
+        document.querySelectorAll('.subbox button[data-copy]').forEach(function (btn) {
+          btn.addEventListener('click', function () {
+            var text = document.getElementById(btn.getAttribute('data-copy')).textContent;
+            copyText(text);
+            toast('已复制订阅地址');
+          });
+        });
+      })();
+
+      // ---------- 纯净度 ----------
+      function purity(n) {
+        var q = n && n.quality;
+        if (!q || q.clean == null || isNaN(Number(q.clean))) return null;
+        return Math.max(0, Math.min(100, Math.round(Number(q.clean))));
+      }
+      function isFlag(n) {
+        var q = n && n.quality;
+        return !!n && (n.residential === 'datacenter' || !!(q && (q.proxy === true || q.hosting === true)));
+      }
+      function isClean(n) {
+        var q = n && n.quality;
+        if (!n || n.success === false || !q || q.proxy === true || q.hosting === true) return false;
+        if (Number(q.risk) > 50 || Number(q.clean) < 50) return false;
+        return n.residential === 'residential' || q.kind === 'isp' || q.mobile === true;
+      }
+      function sortKey(n) {
+        var p = purity(n);
+        var tier = isClean(n) ? 0 : (isFlag(n) ? 2 : 1);
+        return [tier, -(p == null ? -1 : p), n.residential === 'residential' ? 0 : 1, n.latency_ms == null ? 1 : 0, Number(n.latency_ms) || 0];
+      }
+      function cmp(a, b) {
+        var ka = sortKey(a), kb = sortKey(b);
+        for (var i = 0; i < ka.length; i++) if (ka[i] !== kb[i]) return ka[i] < kb[i] ? -1 : 1;
+        return 0;
+      }
+      function level(n) {
+        if (isFlag(n)) return 'r';
+        var p = purity(n);
+        if (p == null) return '';
+        return p >= 80 ? 'g' : (p >= 50 ? 'y' : 'r');
+      }
+      function badge(n) {
+        var lv = level(n), p = purity(n);
+        var icon = lv === 'g' ? '🟢' : (lv === 'y' ? '🟡' : (lv === 'r' ? '🔴' : '⚪'));
+        return '<span class="pill score ' + lv + '" title="纯净度（越高越干净）">' + icon + ' ' + (p == null ? '—' : p) + '</span>';
+      }
+      function tags(n) {
+        var q = n.quality || {};
+        var out = [];
+        if (n.residential === 'residential') out.push('<span class="pill g">住宅</span>');
+        else if (n.residential === 'datacenter') out.push('<span class="pill r">机房</span>');
+        else out.push('<span class="pill">未知</span>');
+        if (q.kind === 'isp' && n.residential !== 'residential') out.push('<span class="pill g">运营商</span>');
+        if (q.mobile === true) out.push('<span class="pill g">移动网络</span>');
+        if (q.proxy === true) out.push('<span class="pill r">已知代理</span>');
+        if (q.hosting === true) out.push('<span class="pill r">托管机房</span>');
+        if (q.risk != null && !isNaN(Number(q.risk))) {
+          var rk = Number(q.risk);
+          out.push('<span class="pill ' + (rk > 50 ? 'r' : (rk > 25 ? 'y' : 'g')) + '">风险 ' + esc(Math.round(rk)) + '</span>');
+        }
+        return out.join('');
+      }
+
+      function statCard(label, value, cls) {
+        return '<div class="stat ' + (cls || '') + '"><div class="k">' + esc(label) + '</div><div class="v">' + esc(value) + '</div></div>';
+      }
+
+      function allNodes() {
+        var d = state.data, list = [];
+        Object.keys((d && d.countries) || {}).forEach(function (k) {
+          var g = d.countries[k];
+          (g.nodes || []).forEach(function (n) { list.push({ n: n, g: g }); });
+        });
+        return list;
       }
 
       function renderStats() {
         var d = state.data;
         if (!d) return;
         var s = d.stats || {};
+        var nodes = allNodes();
+        var cleanCount = s.clean_eligible != null ? s.clean_eligible : nodes.filter(function (x) { return isClean(x.n); }).length;
+        var flagCount = nodes.filter(function (x) { return isFlag(x.n); }).length;
         var items = [
-          ['可用节点', s.success != null ? s.success : 0],
+          ['可用节点', s.success != null ? s.success : nodes.length],
+          ['🟢 纯净住宅/运营商', cleanCount, 'g'],
+          ['🔴 代理/机房', flagCount, 'r'],
           ['国家/地区', s.countries != null ? s.countries : 0],
           ['住宅出口', s.residential_est != null ? s.residential_est : 0],
-          ['机房出口', s.datacenter_est != null ? s.datacenter_est : 0],
-          ['已检测', s.checked != null ? s.checked : 0],
+          ['已画像', s.quality_checked != null ? s.quality_checked : 0],
           ['失败', s.failed != null ? s.failed : 0],
           ['耗时', (d.duration_s != null ? d.duration_s : '?') + 's']
         ];
         document.getElementById('stats').innerHTML = items.map(function (it) {
-          return statCard(it[0], it[1]);
+          return statCard(it[0], it[1], it[2]);
         }).join('');
         document.getElementById('meta').textContent =
           '最后更新：' + (d.generated_at || '未知') +
           '｜数据源：' + (d.source || '未知') +
           '｜Worker：' + (d.worker_host || '未知');
-        document.getElementById('sub-url').textContent =
-          location.origin + location.pathname.replace(/[^/]*$/, '') + 'nodes.txt';
       }
 
       function nodeMatches(node, country) {
-        if (state.filter !== 'all' && node.residential !== state.filter) return false;
+        var f = state.filter;
+        if (f === 'clean' && !isClean(node)) return false;
+        if (f === 'flag' && !isFlag(node)) return false;
+        if ((f === 'residential' || f === 'datacenter') && node.residential !== f) return false;
+        if (f === 'unknown' && (node.residential === 'residential' || node.residential === 'datacenter')) return false;
         if (!state.keyword) return true;
         var text = [
           node.host, node.port, country.code, country.name,
@@ -1446,69 +1739,85 @@ const INDEX_HTML = String.raw`<!DOCTYPE html>
         return text.indexOf(state.keyword) !== -1;
       }
 
+      function nodeRow(n, g, rank, showCountry) {
+        var latency = n.latency_ms != null ? esc(n.latency_ms) + ' ms' : '—';
+        var org = n.exit && n.exit.org ? n.exit.org : '';
+        var where = showCountry ? (g.name || g.code || '') : (n.exit && n.exit.country ? '出口 ' + n.exit.country : '');
+        var orgText = [where, org].filter(Boolean).join(' · ');
+        var cls = isFlag(n) ? 'flag' : (isClean(n) ? 'clean' : '');
+        return '<div class="node ' + cls + '">' +
+          '<span class="rank">' + rank + '</span>' +
+          badge(n) +
+          '<span class="host">' + esc(n.host) + ':' + esc(n.port) + '</span>' +
+          '<span class="tags">' + tags(n) + '</span>' +
+          '<span class="muted lat">' + latency + '</span>' +
+          '<span class="org" title="' + esc(orgText) + '">' + esc(orgText) + '</span>' +
+          '<button class="copy" data-link="' + esc('sstp://vpn:vpn@' + n.host + ':' + n.port) + '">复制</button>' +
+          '</div>';
+      }
+
       function render() {
         var d = state.data;
         var list = document.getElementById('list');
         if (!d) return;
-        var groups = Object.keys(d.countries || {}).map(function (key) {
-          return d.countries[key];
-        }).sort(function (a, b) { return (b.count || 0) - (a.count || 0); });
-
         var html = '';
         var total = 0;
-        groups.forEach(function (g) {
-          var nodes = (g.nodes || []).filter(function (n) { return nodeMatches(n, g); });
-          if (!nodes.length) return;
-          total += nodes.length;
-          var name = g.name || g.code || '未知';
-          html += '<section class="country"><div class="country-head">' +
-            '<strong>' + esc(name) + '</strong>' +
-            '<span class="pill">' + esc(g.code || '??') + '</span>' +
-            '<span class="pill">共 ' + esc(nodes.length) + ' 个</span>' +
-            '<span class="pill res">住宅 ' + esc(g.residential || 0) + '</span>' +
-            '<span class="pill dc">机房 ' + esc(g.datacenter || 0) + '</span>' +
-            '</div>';
-          nodes.forEach(function (n) {
-            var kind = n.residential === 'residential' ? '住宅'
-              : (n.residential === 'datacenter' ? '机房' : '未知');
-            var latency = n.latency_ms != null ? esc(n.latency_ms) + ' ms' : '—';
-            var org = n.exit && n.exit.org ? esc(n.exit.org) : '';
-            var exitCountry = n.exit && n.exit.country ? esc(n.exit.country) : '';
-            html += '<div class="node">' +
-              '<span class="host">' + esc(n.host) + ':' + esc(n.port) + '</span>' +
-              '<span class="pill ' + (n.residential === 'residential' ? 'res' : (n.residential === 'datacenter' ? 'dc' : '')) + '">' + kind + '</span>' +
-              '<span class="muted">' + latency + '</span>' +
-              (exitCountry ? '<span class="muted">出口 ' + exitCountry + '</span>' : '') +
-              (org ? '<span class="muted grow">' + org + '</span>' : '<span class="grow"></span>') +
-              '<button class="copy" data-link="' + esc('sstp://vpn:vpn@' + n.host + ':' + n.port) + '">复制</button>' +
-              '</div>';
-          });
-          html += '</section>';
-        });
+        var all = allNodes().sort(function (a, b) { return cmp(a.n, b.n); });
 
-        if (!html) {
-          html = '<div class="empty">没有匹配的节点</div>';
+        if (state.view === 'rank') {
+          var shown = all.filter(function (x) { return nodeMatches(x.n, x.g); });
+          total = shown.length;
+          if (shown.length) {
+            html = '<section class="country"><div class="country-head"><strong>纯净度排行</strong>' +
+              '<span class="pill">共 ' + shown.length + ' 个</span>' +
+              '<span class="pill g">🟢 纯净 ' + shown.filter(function (x) { return isClean(x.n); }).length + '</span>' +
+              '<span class="pill r">🔴 代理/机房 ' + shown.filter(function (x) { return isFlag(x.n); }).length + '</span></div>' +
+              shown.map(function (x, i) { return nodeRow(x.n, x.g, i + 1, true); }).join('') + '</section>';
+          }
+        } else {
+          var groups = Object.keys(d.countries || {}).map(function (key) { return d.countries[key]; });
+          var best = function (g) {
+            var arr = (g.nodes || []).slice().sort(cmp);
+            return arr.length ? sortKey(arr[0]) : [9];
+          };
+          groups.sort(function (a, b) {
+            var ka = best(a), kb = best(b);
+            for (var i = 0; i < Math.min(ka.length, kb.length); i++) if (ka[i] !== kb[i]) return ka[i] < kb[i] ? -1 : 1;
+            return (b.count || 0) - (a.count || 0);
+          });
+          groups.forEach(function (g) {
+            var nodes = (g.nodes || []).filter(function (n) { return nodeMatches(n, g); }).sort(cmp);
+            if (!nodes.length) return;
+            total += nodes.length;
+            var name = g.name || g.code || '未知';
+            html += '<section class="country"><div class="country-head">' +
+              '<strong>' + esc(name) + '</strong>' +
+              '<span class="pill">' + esc(g.code || '??') + '</span>' +
+              '<span class="pill">共 ' + esc(nodes.length) + ' 个</span>' +
+              '<span class="pill g">🟢 纯净 ' + nodes.filter(isClean).length + '</span>' +
+              '<span class="pill g">住宅 ' + esc(g.residential || 0) + '</span>' +
+              '<span class="pill r">机房 ' + esc(g.datacenter || 0) + '</span>' +
+              '</div>' +
+              nodes.map(function (n, i) { return nodeRow(n, g, i + 1, false); }).join('') +
+              '</section>';
+          });
         }
+
+        if (!html) html = '<div class="empty">没有匹配的节点</div>';
         list.innerHTML = html;
 
         list.querySelectorAll('button.copy').forEach(function (btn) {
-          btn.addEventListener('click', function () {
-            copyText(btn.getAttribute('data-link'));
-          });
+          btn.addEventListener('click', function () { copyText(btn.getAttribute('data-link')); });
         });
 
-        var allLinks = [];
-        groups.forEach(function (g) {
-          (g.nodes || []).forEach(function (n) {
-            allLinks.push('sstp://vpn:vpn@' + n.host + ':' + n.port);
-          });
-        });
+        var allLinks = all.map(function (x) { return 'sstp://vpn:vpn@' + x.n.host + ':' + x.n.port; });
         document.getElementById('copy-all').onclick = function () { copyText(allLinks.join('\n')); };
         document.getElementById('foot').textContent =
-          '当前显示 ' + total + ' 个节点；共 ' + allLinks.length + ' 个可用节点，每 5 分钟自动刷新。';
+          '当前显示 ' + total + ' 个节点；共 ' + allLinks.length + ' 个可用节点（按纯净度排序）。页面可见时每 5 分钟检查更新，切回页面时立即检查。';
       }
 
       function load() {
+        state.lastLoad = Date.now();
         var url = 'data.json?ts=' + Date.now();
         fetch(url, { cache: 'no-store' })
           .then(function (res) {
@@ -1537,11 +1846,18 @@ const INDEX_HTML = String.raw`<!DOCTYPE html>
 
       document.querySelectorAll('.toolbar button[data-filter]').forEach(function (btn) {
         btn.addEventListener('click', function () {
-          document.querySelectorAll('.toolbar button[data-filter]').forEach(function (b) {
-            b.classList.remove('active');
-          });
+          document.querySelectorAll('.toolbar button[data-filter]').forEach(function (b) { b.classList.remove('active'); });
           btn.classList.add('active');
           state.filter = btn.getAttribute('data-filter');
+          render();
+        });
+      });
+
+      document.querySelectorAll('.toolbar button[data-view]').forEach(function (btn) {
+        btn.addEventListener('click', function () {
+          document.querySelectorAll('.toolbar button[data-view]').forEach(function (b) { b.classList.remove('active'); });
+          btn.classList.add('active');
+          state.view = btn.getAttribute('data-view');
           render();
         });
       });
@@ -1551,8 +1867,12 @@ const INDEX_HTML = String.raw`<!DOCTYPE html>
         toast('已刷新');
       });
 
+      // 页面隐藏时暂停轮询，切回时若超过 1 分钟未更新则立即检查
+      document.addEventListener('visibilitychange', function () {
+        if (!document.hidden && Date.now() - state.lastLoad > 60 * 1000) load();
+      });
       load();
-      state.timer = setInterval(load, 5 * 60 * 1000);
+      state.timer = setInterval(function () { if (!document.hidden) load(); }, 5 * 60 * 1000);
     })();
   </script>
 </body>
@@ -1786,16 +2106,29 @@ async function handleStatus(env) {
   return textResponse(JSON.stringify(body, null, 2), "application/json; charset=utf-8", 200, NO_CACHE);
 }
 
-
 return {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     const path = url.pathname.replace(/\/+$/, "") || "/";
     try {
+            if (path === "/sstp-dashboard") {
+        return textResponse(INDEX_HTML, "text/html; charset=utf-8", 200, NO_CACHE);
+      }
       if (path === "/" || path === "/index.html") {
         return textResponse(INDEX_HTML, "text/html; charset=utf-8", 200, NO_CACHE);
       }
-      if (path === "/data.json" || path === "/nodes.txt") {
+            if (path === "/nodes-clean.txt") {
+        const store = getKV(env);
+        const [rawData, rawHosts] = await Promise.all([store.get("data.json", "json"), store.get("edge-hosts.json", "json")]);
+        if (!rawData || !Array.isArray(rawHosts)) {
+          return textResponse("尚未生成纯净订阅：请先打开 /run 执行一次检测\n", "text/plain; charset=utf-8", 404, NO_CACHE);
+        }
+        const parsed = Number.parseInt(url.searchParams.get("maxrisk") || "50", 10);
+        const maxRisk = Number.isFinite(parsed) ? Math.max(0, Math.min(100, parsed)) : 50;
+        const cfg = loadConfig(env);
+        const body = buildCleanNodesText(rawData, rawHosts, cfg, maxRisk);
+        return textResponse(body, "text/plain; charset=utf-8", 200, { "access-control-allow-origin": "*", ...NO_CACHE });
+      }      if (path === "/data.json" || path === "/nodes.txt") {
         const store = getKV(env);
         const key = path.slice(1);
         const value = await store.get(key);
@@ -1826,7 +2159,6 @@ return {
     );
   },
 };
-
 })();
 
 export default {
@@ -1834,12 +2166,14 @@ export default {
     const url = new URL(request.url);
     const p = url.pathname.replace(/\/+$/, '') || '/';
     try {
-      if (p === '/nodes-clean.txt' || p === '/住宅独立.txt') return await handleSSTPNodesText(env, 'residential');
+      if (p === '/nodes-clean.txt') return await SSTP_SUBSYSTEM.fetch(request, env, ctx);
+      if (p === '/住宅独立.txt') return await handleSSTPNodesText(env, 'residential');
       if (p === '/全.txt') return await handleSSTPNodesText(env, 'all');
       if (p === '/nodes.txt') return await SSTP_SUBSYSTEM.fetch(request, env, ctx);
       if (p === '/data.json' || p === '/run' || p === '/api/step' || p === '/status') {
         return await SSTP_SUBSYSTEM.fetch(request, env, ctx);
       }
+      if (p === '/sstp-dashboard') return await SSTP_SUBSYSTEM.fetch(request, env, ctx);
       if (p === '/api/servers') return await handleServersApi(request, ctx);
       if (p === '/api/nodes') {
         if (request.method !== 'GET' && request.method !== 'HEAD') {
